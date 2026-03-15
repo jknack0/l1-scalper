@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find /c/Dev/l1-scalper -type f -name *.md -o -name *.json -o -name *.txt -o -name *.py -o -name *.js -o -name *.ts -o -name *.yaml -o -name *.yml)",
+      "Bash(find /c/Dev/l1-scalper -type f \\\\\\(-not -path */.git/* -not -path */data/* \\\\\\))",
+      "Bash(find /c/Dev/l1-scalper -type d \\\\\\(-not -path */.git/* \\\\\\))",
+      "Read(//c/Dev/scalp/**)",
+      "Read(//c/Dev/scalp//**)",
+      "Bash(find /c/Dev/scalp -maxdepth 3 -type f \\\\\\(-name *.py -path *scripts* -o -name *service* \\\\\\) -not -path */.venv* -not -path */__pycache__*)",
+      "Bash(xargs ls:*)",
+      "Bash(grep -r \"Vultr\\\\|chicago\\\\|bot@\\\\|ssh\\\\|host\" /c/Dev/scalp/*.md /c/Dev/scalp/docs/*.md)",
+      "Bash(pip show:*)",
+      "Bash(python -c \"import databento; help\\(databento.Historical\\)\")",
+      "Bash(python -c \":*)",
+      "Bash(python -m pytest tests/test_features.py -v)",
+      "Bash(python -m pytest tests/test_regime.py -v)",
+      "Bash(python -m pytest tests/test_regime.py::TestMarketRegimeHMM::test_fit_and_predict -v)",
+      "Bash(python:*)",
+      "Bash(du -sh /c/Dev/l1-scalper/data/parquet/year=*/)",
+      "Bash(du -sh /c/Dev/l1-scalper/data/l1/year=*/)",
+      "Bash(wmic process:*)",
+      "Bash(taskkill /PID 84624 /F)",
+      "Bash(TASKKILL //PID 84624 //F)",
+      "Bash(TASKKILL //PID 67156 //F)"
+    ]
+  }
+}
