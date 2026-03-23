@@ -14,39 +14,39 @@ import pytest
 def _make_regime_data(n_per_regime: int = 500, seed: int = 42) -> tuple[np.ndarray, np.ndarray]:
     """Generate synthetic 3-regime data with known labels.
 
-    Features: [realized_vol, return_autocorr, spread_mean, trade_rate_mean]
+    Features: [return_autocorr, hurst, variance_ratio, efficiency_ratio]
 
-    Regime 0 (trending): high autocorr, moderate vol, tight spread, high rate
-    Regime 1 (mean-reverting): negative autocorr, low vol, tight spread, high rate
-    Regime 2 (choppy): zero autocorr, high vol, wide spread, low rate
+    Regime 0 (trending): high autocorr, high Hurst, VR > 1, high efficiency
+    Regime 1 (mean-reverting): negative autocorr, low Hurst, VR < 1, low efficiency
+    Regime 2 (choppy): zero autocorr, Hurst ~0.5, VR ~1, very low efficiency
 
-    Each regime is separated across multiple feature dimensions.
+    All features measure directional structure, not volatility magnitude.
     """
     rng = np.random.default_rng(seed)
     n = n_per_regime
 
-    # Trending: moderate vol, high positive autocorr, tight spread, high rate
+    # Trending: persistent directional moves
     trending = np.column_stack([
-        rng.normal(0.003, 0.0003, n),   # realized_vol (moderate)
         rng.normal(0.5, 0.05, n),       # return_autocorr (high positive)
-        rng.normal(1.0, 0.1, n),        # spread_mean (tight)
-        rng.normal(8.0, 0.5, n),        # trade_rate_mean (high)
+        rng.normal(0.75, 0.03, n),      # hurst (> 0.5, persistent)
+        rng.normal(1.8, 0.15, n),       # variance_ratio (> 1, trending)
+        rng.normal(0.7, 0.05, n),       # efficiency_ratio (high, clean trend)
     ])
 
-    # Mean-reverting: low vol, negative autocorr, tight spread, moderate rate
+    # Mean-reverting: oscillating, anti-persistent
     mean_rev = np.column_stack([
-        rng.normal(0.001, 0.0002, n),   # realized_vol (low)
         rng.normal(-0.4, 0.05, n),      # return_autocorr (negative)
-        rng.normal(1.2, 0.1, n),        # spread_mean (slightly wider)
-        rng.normal(5.0, 0.5, n),        # trade_rate_mean (moderate)
+        rng.normal(0.3, 0.03, n),       # hurst (< 0.5, anti-persistent)
+        rng.normal(0.5, 0.1, n),        # variance_ratio (< 1, mean-reverting)
+        rng.normal(0.15, 0.04, n),      # efficiency_ratio (low, oscillating)
     ])
 
-    # Choppy: high vol, zero autocorr, wide spread, low rate
+    # Choppy: no structure, random noise
     choppy = np.column_stack([
-        rng.normal(0.008, 0.0005, n),   # realized_vol (very high)
         rng.normal(0.0, 0.05, n),       # return_autocorr (near zero)
-        rng.normal(3.0, 0.2, n),        # spread_mean (very wide)
-        rng.normal(1.5, 0.3, n),        # trade_rate_mean (very low)
+        rng.normal(0.5, 0.03, n),       # hurst (~0.5, random walk)
+        rng.normal(1.0, 0.1, n),        # variance_ratio (~1, random)
+        rng.normal(0.1, 0.03, n),       # efficiency_ratio (very low, noise)
     ])
 
     data = np.vstack([trending, mean_rev, choppy])
@@ -149,17 +149,17 @@ class TestMarketRegimeHMM:
         np.testing.assert_allclose(tm.sum(axis=1), 1.0, atol=1e-6)
 
     def test_state_label_assignment(self):
-        """Trending state should have highest autocorr mean,
+        """Trending state should have highest Hurst mean,
         mean-reverting should have lowest."""
-        from src.regime.hmm import MarketRegimeHMM, TRENDING, MEAN_REVERTING
+        from src.regime.hmm import MarketRegimeHMM, TRENDING, MEAN_REVERTING, FEAT_HURST
 
         data, _ = _make_regime_data(n_per_regime=500)
         model = MarketRegimeHMM(n_iter=200, random_state=42)
         model.fit(data)
 
         means = model.means
-        # Trending (state 0) should have highest autocorr (index 1)
-        assert means[TRENDING, 1] > means[MEAN_REVERTING, 1]
+        # Trending should have highest Hurst, mean-reverting should have lowest
+        assert means[TRENDING, FEAT_HURST] > means[MEAN_REVERTING, FEAT_HURST]
 
 
 # ── BOCPD Tests ─────────────────────────────────────────────────
@@ -393,6 +393,217 @@ class TestPositionSizer:
 
         weights = sizer.get_weights(state)
         assert weights["trending"] > 0.8
+
+
+# ── Micro HMM Tests ────────────────────────────────────────────
+
+def _make_micro_regime_data(n_per_regime: int = 500, seed: int = 42) -> np.ndarray:
+    """Generate synthetic 3-state micro regime data.
+
+    Features: [spread, trade_rate, return_autocorr, realized_vol, ofi]
+
+    Regime 0 (liquid_trending): tight spread, high activity, positive autocorr, moderate vol, high OFI
+    Regime 1 (liquid_mean_reverting): tight spread, high activity, negative autocorr, low vol, low OFI
+    Regime 2 (illiquid): wide spread, low activity, no autocorr, high vol, low OFI
+    """
+    rng = np.random.default_rng(seed)
+    n = n_per_regime
+
+    liquid_trending = np.column_stack([
+        rng.normal(1.0, 0.1, n),     # spread (tight)
+        rng.normal(50.0, 5.0, n),    # trade_rate (high)
+        rng.normal(0.4, 0.05, n),    # return_autocorr (positive)
+        rng.normal(0.001, 0.0002, n),# realized_vol (moderate)
+        rng.normal(20.0, 3.0, n),    # ofi (high)
+    ])
+
+    liquid_mr = np.column_stack([
+        rng.normal(1.0, 0.1, n),     # spread (tight)
+        rng.normal(45.0, 5.0, n),    # trade_rate (high)
+        rng.normal(-0.3, 0.05, n),   # return_autocorr (negative)
+        rng.normal(0.0005, 0.0001, n),# realized_vol (low)
+        rng.normal(5.0, 2.0, n),     # ofi (low)
+    ])
+
+    illiquid = np.column_stack([
+        rng.normal(4.0, 0.5, n),     # spread (wide)
+        rng.normal(5.0, 2.0, n),     # trade_rate (low)
+        rng.normal(0.0, 0.05, n),    # return_autocorr (none)
+        rng.normal(0.003, 0.001, n), # realized_vol (high)
+        rng.normal(3.0, 1.0, n),     # ofi (low)
+    ])
+
+    return np.vstack([liquid_trending, liquid_mr, illiquid])
+
+
+class TestMicroRegimeHMM:
+    def test_fit_and_predict(self):
+        from src.regime.micro_hmm import MicroRegimeHMM
+
+        data = _make_micro_regime_data(n_per_regime=500)
+        model = MicroRegimeHMM(n_iter=200, random_state=42)
+        model.fit(data, lengths=[500, 500, 500])
+
+        # Each block should be mostly one state
+        for i in range(3):
+            block = data[i * 500 : (i + 1) * 500]
+            preds = model.predict(block)
+            dominant = np.bincount(preds, minlength=3).argmax()
+            purity = (preds == dominant).mean()
+            assert purity > 0.7, f"Block {i} purity {purity:.2f} too low"
+
+    def test_predict_proba_sums_to_one(self):
+        from src.regime.micro_hmm import MicroRegimeHMM
+
+        data = _make_micro_regime_data(n_per_regime=200)
+        model = MicroRegimeHMM(n_iter=50, random_state=42)
+        model.fit(data)
+
+        proba = model.predict_proba(data[:50])
+        assert proba.shape == (3,)
+        np.testing.assert_allclose(proba.sum(), 1.0, atol=1e-6)
+
+    def test_save_and_load(self):
+        from src.regime.micro_hmm import MicroRegimeHMM
+
+        data = _make_micro_regime_data(n_per_regime=200)
+        model = MicroRegimeHMM(n_iter=50, random_state=42)
+        model.fit(data)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "micro_hmm.pkl"
+            model.save(path)
+
+            model2 = MicroRegimeHMM()
+            model2.load(path)
+
+            np.testing.assert_array_equal(
+                model.predict(data[:100]),
+                model2.predict(data[:100]),
+            )
+
+    def test_state_label_assignment(self):
+        """Illiquid state should have highest spread, liquid states should have low spread."""
+        from src.regime.micro_hmm import MicroRegimeHMM, ILLIQUID, FEAT_SPREAD
+
+        data = _make_micro_regime_data(n_per_regime=500)
+        model = MicroRegimeHMM(n_iter=200, random_state=42)
+        model.fit(data)
+
+        means = model.means
+        # Illiquid should have the highest spread
+        assert means[ILLIQUID, FEAT_SPREAD] > means[0, FEAT_SPREAD] or \
+               means[ILLIQUID, FEAT_SPREAD] > means[1, FEAT_SPREAD]
+
+    def test_transition_matrix_rows_sum_to_one(self):
+        from src.regime.micro_hmm import MicroRegimeHMM
+
+        data = _make_micro_regime_data(n_per_regime=200)
+        model = MicroRegimeHMM(n_iter=50, random_state=42)
+        model.fit(data)
+
+        tm = model.transition_matrix
+        assert tm.shape == (3, 3)
+        np.testing.assert_allclose(tm.sum(axis=1), 1.0, atol=1e-6)
+
+
+class TestCompositeRegimeDetector:
+    """Test the macro + micro composite regime detector."""
+
+    def _fit_detectors(self):
+        from src.regime.regime_detector import RegimeDetector
+
+        macro_data, _ = _make_regime_data(n_per_regime=300)
+        micro_data = _make_micro_regime_data(n_per_regime=300)
+
+        detector = RegimeDetector()
+        detector.hmm.fit(macro_data)
+
+        # Fit micro HMM separately
+        from src.regime.micro_hmm import MicroRegimeHMM
+        micro_model = MicroRegimeHMM(n_iter=100, random_state=42)
+        micro_model.fit(micro_data)
+
+        # Save and reload into detector
+        with tempfile.TemporaryDirectory() as tmpdir:
+            macro_path = Path(tmpdir) / "macro.pkl"
+            micro_path = Path(tmpdir) / "micro.pkl"
+            detector.hmm.save(macro_path)
+            micro_model.save(micro_path)
+
+            detector = RegimeDetector(
+                hmm_model_path=macro_path,
+                micro_hmm_model_path=micro_path,
+            )
+
+        return detector, macro_data, micro_data
+
+    def test_update_with_micro(self):
+        detector, macro_data, micro_data = self._fit_detectors()
+
+        state = detector.update(macro_data[0], micro_features=micro_data[0])
+
+        assert state.posteriors.shape == (3,)
+        assert state.micro_posteriors is not None
+        assert state.micro_posteriors.shape == (3,)
+        assert state.micro_dominant in (0, 1, 2)
+        assert state.tradeable in (True, False)
+        assert state.entry_strategy in ("momentum", "fade", "none")
+
+    def test_illiquid_blocks_trading(self):
+        """When micro says illiquid, tradeable should be False."""
+        from src.regime.regime_detector import RegimeState
+        from src.regime.micro_hmm import ILLIQUID
+
+        state = RegimeState(
+            posteriors=np.array([0.8, 0.1, 0.1]),  # macro says trending
+            dominant_regime=0,
+            confidence=0.8,
+            changepoint_prob=0.0,
+            bars_since_transition=10,
+            in_cooldown=False,
+            micro_posteriors=np.array([0.1, 0.1, 0.8]),
+            micro_dominant=ILLIQUID,
+            micro_confidence=0.8,
+        )
+
+        assert state.micro_regime_name == "illiquid"
+
+    def test_macro_only_still_works(self):
+        """Detector without micro HMM should still work."""
+        from src.regime.regime_detector import RegimeDetector
+
+        macro_data, _ = _make_regime_data(n_per_regime=300)
+        detector = RegimeDetector()
+        detector.hmm.fit(macro_data)
+
+        state = detector.update(macro_data[0])
+        assert state.micro_posteriors is None
+        assert state.micro_dominant == -1
+
+    def test_position_sizer_illiquid_zeros(self):
+        """Position sizer should zero out weights when micro is illiquid."""
+        from src.regime.position_sizer import RegimePositionSizer
+        from src.regime.regime_detector import RegimeState
+        from src.regime.micro_hmm import ILLIQUID
+
+        sizer = RegimePositionSizer()
+
+        state = RegimeState(
+            posteriors=np.array([0.9, 0.05, 0.05]),
+            dominant_regime=0,
+            confidence=0.9,
+            changepoint_prob=0.0,
+            bars_since_transition=20,
+            in_cooldown=False,
+            micro_posteriors=np.array([0.05, 0.05, 0.9]),
+            micro_dominant=ILLIQUID,
+            micro_confidence=0.9,
+        )
+
+        weights = sizer.get_weights(state)
+        assert weights["trending"] == 0.0
+        assert weights["mean_reverting"] == 0.0
 
 
 # ── Trainer Resample Tests ──────────────────────────────────────

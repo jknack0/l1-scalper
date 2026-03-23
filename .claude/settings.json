@@ -22,6 +22,9 @@
       "Bash(taskkill /PID 84624 /F)",
       "Bash(TASKKILL //PID 84624 //F)",
       "Bash(TASKKILL //PID 67156 //F)"
+    ],
+    "additionalDirectories": [
+      "/tmp/test_rth"
     ]
   }
 }

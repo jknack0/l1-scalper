@@ -85,23 +85,32 @@ def train_hmm(
     return model, report
 
 
-def evaluate_regime_stability(model: MarketRegimeHMM, data: np.ndarray) -> dict:
+def evaluate_regime_stability(
+    model: MarketRegimeHMM,
+    data: np.ndarray,
+    state_names: dict[int, str] | None = None,
+) -> dict:
     """Evaluate regime label stability on held-out data.
+
+    Works with both macro (MarketRegimeHMM) and micro (MicroRegimeHMM) models.
 
     Returns:
         Dict with per-state time percentages, mean durations, transition matrix.
     """
+    if state_names is None:
+        state_names = STATE_NAMES
+
     labels = model.predict(data)
     n = len(labels)
 
     # Time in each state
     state_pcts = {}
-    for state_id, name in STATE_NAMES.items():
+    for state_id, name in state_names.items():
         pct = float(np.mean(labels == state_id))
         state_pcts[name] = round(pct * 100, 1)
 
     # Average duration per state (consecutive run lengths)
-    durations: dict[int, list[int]] = {0: [], 1: [], 2: []}
+    durations: dict[int, list[int]] = {i: [] for i in state_names}
     run_len = 1
     for i in range(1, n):
         if labels[i] == labels[i - 1]:
@@ -112,7 +121,7 @@ def evaluate_regime_stability(model: MarketRegimeHMM, data: np.ndarray) -> dict:
     durations[labels[-1]].append(run_len)
 
     avg_durations = {}
-    for state_id, name in STATE_NAMES.items():
+    for state_id, name in state_names.items():
         runs = durations[state_id]
         avg_durations[name] = round(float(np.mean(runs)), 1) if runs else 0.0
 
@@ -129,8 +138,9 @@ def evaluate_regime_stability(model: MarketRegimeHMM, data: np.ndarray) -> dict:
 @click.option("--output", type=click.Path(path_type=Path), required=True,
               help="Path to save the trained HMM model.")
 @click.option("--train-pct", type=float, default=0.7, help="Training split fraction.")
-@click.option("--feature-indices", type=str, default="8,11,4,5",
-              help="Comma-separated indices of [realized_vol, return_autocorr, spread, trade_rate].")
+@click.option("--feature-indices", type=str, default="11,7,11,11",
+              help="Comma-separated indices of [return_autocorr, hurst, variance_ratio, efficiency_ratio]. "
+                   "Note: variance_ratio and efficiency_ratio are computed from returns, not stored features.")
 @click.option("--verbose", "-v", is_flag=True)
 def cli(
     data_dir: Path,

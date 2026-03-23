@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections import deque
 from math import log
 
+import numpy as np
+
 from src.data.schemas import L1Record
 from src.features.base import Feature
 
@@ -47,25 +49,21 @@ class ReturnAutocorrelation(Feature):
         return self._compute()
 
     def _compute(self) -> float:
-        """Lag-1 autocorrelation via Pearson formula."""
-        rets = list(self._returns)
-        n = len(rets)
+        """Lag-1 autocorrelation via NumPy vectorized Pearson formula."""
+        rets = np.array(self._returns)
 
-        x = rets[:-1]  # r_t
-        y = rets[1:]   # r_{t+1}
+        x = rets[:-1]
+        y = rets[1:]
 
-        mean_x = sum(x) / len(x)
-        mean_y = sum(y) / len(y)
+        dx = x - x.mean()
+        dy = y - y.mean()
 
-        cov = sum((xi - mean_x) * (yi - mean_y) for xi, yi in zip(x, y)) / len(x)
-        var_x = sum((xi - mean_x) ** 2 for xi in x) / len(x)
-        var_y = sum((yi - mean_y) ** 2 for yi in y) / len(y)
-
-        denom = (var_x * var_y) ** 0.5
+        denom = np.sqrt((dx * dx).sum() * (dy * dy).sum())
         if denom < 1e-15:
             return 0.0
 
-        return max(-1.0, min(1.0, cov / denom))
+        corr = float((dx * dy).sum() / denom)
+        return max(-1.0, min(1.0, corr))
 
     def reset(self) -> None:
         self._returns.clear()

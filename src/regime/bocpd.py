@@ -27,23 +27,20 @@ class NormalInverseGamma:
         self.alpha0 = alpha0
         self.beta0 = beta0
 
-    def log_predictive(self, x: float, mu: float, kappa: float,
-                       alpha: float, beta: float) -> float:
-        """Log predictive probability of observation x under the Student-t posterior."""
-        from math import lgamma, log, pi
+    def log_predictive_batch(self, x: float, mu: np.ndarray, kappa: np.ndarray,
+                             alpha: np.ndarray, beta: np.ndarray) -> np.ndarray:
+        """Vectorized log predictive probability for all run lengths at once."""
+        from scipy.special import gammaln
 
         nu = 2.0 * alpha
         var = beta * (kappa + 1.0) / (alpha * kappa)
+        var = np.maximum(var, 1e-10)
 
-        if var <= 0:
-            var = 1e-10
-
-        # Student-t log PDF
         log_p = (
-            lgamma((nu + 1.0) / 2.0)
-            - lgamma(nu / 2.0)
-            - 0.5 * log(nu * pi * var)
-            - ((nu + 1.0) / 2.0) * log(1.0 + (x - mu) ** 2 / (nu * var))
+            gammaln((nu + 1.0) / 2.0)
+            - gammaln(nu / 2.0)
+            - 0.5 * np.log(nu * np.pi * var)
+            - ((nu + 1.0) / 2.0) * np.log(1.0 + (x - mu) ** 2 / (nu * var))
         )
         return log_p
 
@@ -92,12 +89,10 @@ class BOCPD:
         x = observation
         n = len(self._log_R)
 
-        # 1. Evaluate predictive probabilities for each run length
-        log_pred = np.array([
-            self._nig.log_predictive(x, self._mu[i], self._kappa[i],
-                                     self._alpha[i], self._beta[i])
-            for i in range(n)
-        ])
+        # 1. Evaluate predictive probabilities for all run lengths (vectorized)
+        log_pred = self._nig.log_predictive_batch(
+            x, self._mu, self._kappa, self._alpha, self._beta
+        )
 
         # 2. Growth probabilities: P(r_t = r_{t-1} + 1, x_{1:t})
         log_growth = self._log_R + log_pred + self._log_1m_hazard

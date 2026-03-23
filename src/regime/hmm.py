@@ -1,9 +1,12 @@
-"""3-state Gaussian HMM for market regime classification.
+"""3-state GMM-HMM for market regime classification.
+
+Uses multiple Gaussian mixture components per state to capture fat-tailed
+financial returns, with a sticky transition prior to encourage regime persistence.
 
 States:
     0 = TRENDING       — persistent directional moves, positive return autocorrelation
     1 = MEAN_REVERTING — oscillating, negative return autocorrelation
-    2 = CHOPPY         — noisy, no structure, high spread, low trade rate
+    2 = CHOPPY         — noisy, no structure, low efficiency
 """
 
 from __future__ import annotations
@@ -13,7 +16,7 @@ import pickle
 from pathlib import Path
 
 import numpy as np
-from hmmlearn.hmm import GaussianHMM
+from hmmlearn.hmm import GMMHMM
 
 logger = logging.getLogger(__name__)
 
@@ -25,24 +28,27 @@ CHOPPY = 2
 STATE_NAMES = {TRENDING: "trending", MEAN_REVERTING: "mean_reverting", CHOPPY: "choppy"}
 
 # Feature indices for the 4-feature input vector per 1-min bar
-FEAT_REALIZED_VOL = 0
-FEAT_RETURN_AUTOCORR = 1
-FEAT_SPREAD_MEAN = 2
-FEAT_TRADE_RATE_MEAN = 3
+FEAT_RETURN_AUTOCORR = 0
+FEAT_HURST = 1
+FEAT_VARIANCE_RATIO = 2
+FEAT_EFFICIENCY_RATIO = 3
 
 N_FEATURES = 4
 
 
 class MarketRegimeHMM:
-    """3-state Gaussian HMM for regime classification.
+    """3-state GMM-HMM for regime classification.
 
-    Input: [n_bars, 4] array of 1-minute bar features:
-        [realized_vol, return_autocorr, spread_mean, trade_rate_mean]
+    Uses GMMHMM with multiple mixture components per state to handle
+    fat-tailed financial returns, plus a sticky transition prior.
+
+    Input: [n_bars, 4] array of features:
+        [return_autocorr, hurst_exponent, variance_ratio, efficiency_ratio]
 
     After fitting, state labels are mapped so that:
-        - TRENDING = state with highest mean return_autocorr
-        - MEAN_REVERTING = state with lowest mean return_autocorr
-        - CHOPPY = remaining state
+        - TRENDING = state with highest mean hurst_exponent
+        - MEAN_REVERTING = state with lowest mean hurst_exponent
+        - CHOPPY = remaining state (low efficiency, hurst near 0.5)
     """
 
     def __init__(
@@ -50,74 +56,93 @@ class MarketRegimeHMM:
         n_iter: int = 200,
         tol: float = 1e-4,
         covariance_type: str = "full",
+        n_mix: int = 3,
+        sticky: float = 0.95,
         random_state: int = 42,
     ) -> None:
-        self._model = GaussianHMM(
+        self._n_mix = n_mix
+        self._sticky = sticky
+        self._model = GMMHMM(
             n_components=3,
+            n_mix=n_mix,
             covariance_type=covariance_type,
             n_iter=n_iter,
             tol=tol,
             random_state=random_state,
+            init_params="mcw",  # init emissions only
+            params="mcwt",      # learn transitions + emissions
         )
+        # Sticky transition prior: high diagonal
+        self._model.startprob_ = np.array([1.0 / 3, 1.0 / 3, 1.0 / 3])
+        off_diag = (1.0 - sticky) / 2.0
+        self._model.transmat_ = np.array([
+            [sticky, off_diag, off_diag],
+            [off_diag, sticky, off_diag],
+            [off_diag, off_diag, sticky],
+        ])
         self._state_map: dict[int, int] = {0: 0, 1: 1, 2: 2}
         self._fitted = False
 
     def fit(self, data: np.ndarray, lengths: list[int] | None = None) -> None:
-        """Fit the HMM on 1-minute bar features. Shape: [n_bars, 4].
+        """Fit the GMM-HMM on feature data. Shape: [n_bars, 4].
 
-        Uses GMM to initialize emission parameters before EM, which avoids
-        the local-optima problem where HMM merges two distinct regimes.
+        Transition matrix is fixed (sticky prior), only emissions are learned.
         """
         assert data.ndim == 2 and data.shape[1] == N_FEATURES, (
             f"Expected shape [n, {N_FEATURES}], got {data.shape}"
         )
 
-        logger.info("Fitting HMM on %d bars", data.shape[0])
+        logger.info("Fitting GMM-HMM on %d bars (n_mix=%d, sticky=%.2f)",
+                     data.shape[0], self._n_mix, self._sticky)
 
-        # Initialize with GMM for better emission estimates
-        from sklearn.mixture import GaussianMixture
-
-        gmm = GaussianMixture(n_components=3, covariance_type="full", n_init=10, random_state=42)
-        gmm.fit(data)
-        self._model.means_ = gmm.means_
-        self._model.covars_ = gmm.covariances_
-
-        # Only fit transitions and start probs from EM, keep GMM emissions as init
-        self._model.init_params = "st"
         self._model.fit(data, lengths=lengths)
         self._fitted = True
 
-        # Map raw states to semantic labels based on return_autocorr means
+        # Map raw states to semantic labels
         self._assign_state_labels()
 
         logger.info(
-            "HMM fitted. Transition matrix:\n%s",
+            "GMM-HMM fitted. Transition matrix:\n%s",
             np.array2string(self.transition_matrix, precision=3),
         )
+        weighted_means = self._weighted_means()
         for raw, semantic in self._state_map.items():
-            means = self._model.means_[raw]
+            m = weighted_means[raw]
             logger.info(
-                "  Raw state %d -> %s (vol=%.4f, autocorr=%.4f, spread=%.4f, rate=%.4f)",
+                "  Raw state %d -> %s (autocorr=%.4f, hurst=%.4f, var_ratio=%.4f, efficiency=%.4f)",
                 raw,
                 STATE_NAMES[semantic],
-                means[FEAT_REALIZED_VOL],
-                means[FEAT_RETURN_AUTOCORR],
-                means[FEAT_SPREAD_MEAN],
-                means[FEAT_TRADE_RATE_MEAN],
+                m[FEAT_RETURN_AUTOCORR],
+                m[FEAT_HURST],
+                m[FEAT_VARIANCE_RATIO],
+                m[FEAT_EFFICIENCY_RATIO],
             )
+
+    def _weighted_means(self) -> np.ndarray:
+        """Compute weight-averaged means per state from GMMHMM.
+
+        GMMHMM stores means_ as [n_components, n_mix, n_features]
+        and weights_ as [n_components, n_mix]. Returns [n_components, n_features].
+        """
+        # means_: [n_components, n_mix, n_features], weights_: [n_components, n_mix]
+        weights = self._model.weights_  # [n_components, n_mix]
+        means = self._model.means_     # [n_components, n_mix, n_features]
+        # Weighted average across mixture components
+        return np.einsum("cm,cmf->cf", weights, means)
 
     def _assign_state_labels(self) -> None:
         """Map raw HMM states to semantic labels.
 
-        Heuristic:
-            - TRENDING = highest absolute return_autocorr (positive)
-            - MEAN_REVERTING = most negative return_autocorr
-            - CHOPPY = remaining (highest spread or lowest trade rate)
+        Heuristic using Hurst exponent as primary discriminator:
+            - TRENDING = highest mean Hurst (H > 0.5, persistent)
+            - MEAN_REVERTING = lowest mean Hurst (H < 0.5, anti-persistent)
+            - CHOPPY = remaining (H ≈ 0.5, random walk / no structure)
         """
-        autocorrs = self._model.means_[:, FEAT_RETURN_AUTOCORR]
-        sorted_idx = np.argsort(autocorrs)
+        wm = self._weighted_means()
+        hursts = wm[:, FEAT_HURST]
+        sorted_idx = np.argsort(hursts)
 
-        # Lowest autocorr = mean-reverting, highest = trending, middle = choppy
+        # Lowest Hurst = mean-reverting, highest = trending, middle = choppy
         self._state_map = {
             int(sorted_idx[0]): MEAN_REVERTING,
             int(sorted_idx[1]): CHOPPY,
@@ -180,8 +205,8 @@ class MarketRegimeHMM:
 
     @property
     def means(self) -> np.ndarray:
-        """Mapped state means: shape [3, 4]."""
-        raw = self._model.means_
+        """Mapped state means: shape [3, 4] (weighted across mixture components)."""
+        raw = self._weighted_means()
         mapped = np.zeros_like(raw)
         for raw_state, semantic_state in self._state_map.items():
             mapped[semantic_state] = raw[raw_state]

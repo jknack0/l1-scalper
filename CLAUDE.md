@@ -162,6 +162,7 @@ Every backtest result should be challenged against these failure modes. If a bac
 - Parquet for all data storage — partition by date, use pyarrow
 - All features must pass Augmented Dickey-Fuller stationarity test before use
 - Use Welford's online algorithm for running statistics (mean, variance) — never batch normalize over future data
+- **Never use Python loops over data** — always use NumPy vectorized operations. Replace `for` loops over arrays with reshape/broadcasting/advanced indexing. Use `np.cumsum`, `np.where`, `np.lib.stride_tricks` instead of manual iteration. This applies to feature computation, R/S calculations, window extraction, and label construction. The only acceptable loops are over a small fixed set (e.g., iterating over 3-4 chunk sizes).
 
 ## Project Conventions
 - Data lives in `data/` (gitignored) — never commit market data
