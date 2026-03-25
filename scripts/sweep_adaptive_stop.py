@@ -308,6 +308,92 @@ def _adjust_session_breaks(session_breaks: np.ndarray, start: int, end: int) -> 
     return session_breaks[mask] - start
 
 
+# -- Robustness checks -------------------------------------------------
+
+def _sensitivity_analysis(
+    base_config: AdaptiveStopConfig,
+    p_up: np.ndarray,
+    mid: np.ndarray,
+    bid: np.ndarray,
+    ask: np.ndarray,
+    session_breaks: np.ndarray,
+) -> dict:
+    """Perturb each param +/- 1 step, report score change."""
+    base_result = run_backtest(p_up, mid, bid, ask, session_breaks, base_config)
+    base_score = _score(base_result)
+    perturbations = {}
+
+    for param, values in PARAM_RANGES.items():
+        current = getattr(base_config, param)
+        if current not in values:
+            continue
+        idx = values.index(current)
+        scores = {}
+
+        for direction, offset in [("down", -1), ("up", 1)]:
+            new_idx = idx + offset
+            if new_idx < 0 or new_idx >= len(values):
+                continue
+            cfg_dict = asdict(base_config)
+            cfg_dict[param] = values[new_idx]
+            cfg = AdaptiveStopConfig(**cfg_dict)
+            try:
+                cfg.validate()
+            except ValueError:
+                continue
+            r = run_backtest(p_up, mid, bid, ask, session_breaks, cfg)
+            scores[direction] = _score(r)
+
+        perturbations[param] = {
+            "base_score": base_score,
+            **scores,
+        }
+
+    return perturbations
+
+
+def _monte_carlo_test(
+    trade_pnls: list[float],
+    n_permutations: int = 10_000,
+    rng: np.random.Generator | None = None,
+) -> dict:
+    """Shuffle trade P&Ls, check if actual net beats 95th percentile."""
+    rng = rng or np.random.default_rng(42)
+    pnls = np.array(trade_pnls)
+    actual_net = pnls.sum()
+
+    shuffled_nets = np.empty(n_permutations)
+    for i in range(n_permutations):
+        signs = rng.choice([-1, 1], size=len(pnls))
+        shuffled_nets[i] = (pnls * signs).sum()
+
+    p95 = np.percentile(shuffled_nets, 95)
+    p_value = float((shuffled_nets >= actual_net).mean())
+
+    return {
+        "actual_net_pnl": float(actual_net),
+        "p95_threshold": float(p95),
+        "p_value": p_value,
+        "significant": bool(actual_net > p95),
+    }
+
+
+def _surface_flatness(all_scores: list[float], best_score: float) -> dict:
+    """Count configs within 80% of best score."""
+    if best_score > 0:
+        threshold = best_score * 0.8
+    else:
+        threshold = best_score * 1.2
+    n_good = sum(1 for s in all_scores if s >= threshold)
+    return {
+        "best_score": best_score,
+        "threshold_80pct": threshold,
+        "n_good_configs": n_good,
+        "n_total_configs": len(all_scores),
+        "pct_good": n_good / len(all_scores) * 100 if all_scores else 0,
+    }
+
+
 # -- CLI ---------------------------------------------------------------
 
 @click.command()
@@ -417,6 +503,7 @@ def main(
     all_model_results: dict[str, dict] = {}
     best_configs: dict[str, dict] = {}
     all_sweep_rows: list[dict] = []
+    robustness_report: dict[str, dict] = {}
 
     for model_name in model_names:
         model_path = model_dir_path / f"{model_name}.pt"
@@ -521,6 +608,12 @@ def main(
 
             low_confidence = oos_result.n_trades < MIN_OOS_TRADES
 
+            # Collect per-trade dollar P&Ls for Monte Carlo (tick pnl * tick_value - per-trade commission)
+            oos_trade_pnls = [
+                t.pnl_ticks * MES_TICK_VALUE - best_cfg.commission_rt_dollars
+                for t in oos_result.trades
+            ]
+
             fold_results.append({
                 "test_month": test_label,
                 "train_bars": train_end - train_start,
@@ -536,6 +629,7 @@ def main(
                 "oos_max_dd_ticks": oos_result.max_drawdown_ticks,
                 "oos_avg_hold": oos_result.avg_hold_bars,
                 "low_confidence": low_confidence,
+                "oos_trade_pnls": oos_trade_pnls,
                 "oos_exits": {
                     "signal": oos_result.exits_signal,
                     "hard_sl": oos_result.exits_hard_sl,
@@ -592,6 +686,56 @@ def main(
             # Pick best config from the last fold as the "production" config
             last_fold = fold_results[-1]
             best_configs[model_name] = last_fold["best_params"]
+
+            # -- Robustness checks --
+            click.echo(f"\n  Robustness checks for {model_name}...")
+
+            # 1. Collect all OOS trade P&Ls across folds for Monte Carlo
+            all_oos_pnls: list[float] = []
+            for fr in fold_results:
+                all_oos_pnls.extend(fr["oos_trade_pnls"])
+
+            mc_result = _monte_carlo_test(all_oos_pnls, rng=rng)
+            mc_sig = "YES" if mc_result["significant"] else "NO"
+            click.echo(f"    Monte Carlo: p={mc_result['p_value']:.4f}, significant={mc_sig}")
+
+            # 2. Collect all sweep scores across folds for surface flatness
+            all_fold_scores: list[float] = []
+            for row in all_sweep_rows:
+                if row["model"] == model_name and row["fold_type"] == "train":
+                    s = row["score"]
+                    if s != float("-inf"):
+                        all_fold_scores.append(s)
+
+            best_overall_score = max(all_fold_scores) if all_fold_scores else 0.0
+            sf_result = _surface_flatness(all_fold_scores, best_overall_score)
+            click.echo(f"    Surface flatness: {sf_result['n_good_configs']}/{sf_result['n_total_configs']} "
+                       f"({sf_result['pct_good']:.1f}%) within 80% of best")
+
+            # 3. Sensitivity analysis on full data with best config
+            best_cfg_obj = AdaptiveStopConfig(**last_fold["best_params"])
+            sens_result = _sensitivity_analysis(
+                best_cfg_obj, p_up_gated, mid, bid, ask, session_breaks,
+            )
+            # Count fragile params (>20% score change from 1-step perturbation)
+            n_fragile = 0
+            for param, pdata in sens_result.items():
+                base = pdata["base_score"]
+                if base == 0:
+                    continue
+                for d in ["down", "up"]:
+                    if d in pdata:
+                        change_pct = abs(pdata[d] - base) / abs(base) * 100
+                        if change_pct > 20:
+                            n_fragile += 1
+                            break
+            click.echo(f"    Sensitivity: {n_fragile}/{len(sens_result)} params fragile (>20% score change)")
+
+            robustness_report[model_name] = {
+                "sensitivity": sens_result,
+                "surface_flatness": sf_result,
+                "monte_carlo": mc_result,
+            }
         else:
             click.echo(f"\n  NO VALID FOLDS for {model_name}")
             all_model_results[model_name] = {
@@ -628,7 +772,11 @@ def main(
     # -- Save results ----------------------------------------------
     click.echo(f"\n[4/4] SAVING RESULTS")
 
-    # sweep_results.json
+    # sweep_results.json (strip oos_trade_pnls to avoid bloat)
+    for model_data in all_model_results.values():
+        for fold in model_data.get("folds", []):
+            fold.pop("oos_trade_pnls", None)
+
     out_path = run_dir / "sweep_results.json"
     with open(out_path, "w") as f:
         json.dump(all_model_results, f, indent=2, default=str)
@@ -646,6 +794,13 @@ def main(
         csv_path = run_dir / "sweep_log.csv"
         log_df.to_csv(csv_path, index=False)
         click.echo(f"  {csv_path} ({len(log_df):,} rows)")
+
+    # robustness_report.json
+    if robustness_report:
+        rob_path = run_dir / "robustness_report.json"
+        with open(rob_path, "w") as f:
+            json.dump(robustness_report, f, indent=2, default=float)
+        click.echo(f"  {rob_path}")
 
     elapsed = time.time() - overall_t0
     click.echo(f"\n  Total time: {elapsed:.0f}s ({elapsed / 60:.1f} min)")
