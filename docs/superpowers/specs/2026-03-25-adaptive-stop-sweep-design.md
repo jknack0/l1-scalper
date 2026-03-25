@@ -44,12 +44,22 @@ class AdaptiveStopConfig:
 
 ## Stop Price Computation
 
-Each bar, compute a single stop level (in ticks relative to entry) by taking the max of all active mechanics:
+Each bar, compute a single stop level (in ticks relative to entry) by taking the max of all active mechanics.
+
+**Key invariant:** `mfe` is monotonically non-decreasing (running max of P&L). Tier activations use `mfe`, not `current_pnl`, so once a tier activates it stays active even if price retraces. The final `stop_level` is also ratcheted across bars — it never moves backward. This prevents the velocity ratchet (which fires transiently) from loosening the stop on the next bar.
+
+**Mid-price vs fill-adjusted price:** Stop evaluation uses mid-price P&L (consistent with existing position manager). The spread cost is applied post-hoc in the fill model. This means `breakeven_lock_ticks = 0` locks the stop at entry mid-price, which is actually a small loss after spread. To truly break even after spread, set `breakeven_lock_ticks >= 1.0` (covers ~1 tick spread). The sweep will find the right value per regime.
 
 ```
+On position entry:
+  mfe = 0.0
+  prev_stop_level = -hard_sl_ticks
+  pnl_history = ring_buffer(size=max_velocity_lookback)  # reset per trade
+
 Every bar:
   current_pnl = (mid - entry) * direction  # in ticks
-  mfe = max(mfe, current_pnl)              # track best profit
+  mfe = max(mfe, current_pnl)              # monotonically non-decreasing
+  pnl_history.append(current_pnl)
 
   # 1. Hard SL (always)
   stop_level = -hard_sl_ticks
@@ -58,7 +68,7 @@ Every bar:
   if mfe >= breakeven_trigger_ticks and breakeven_trigger_ticks > 0:
       stop_level = max(stop_level, breakeven_lock_ticks)
 
-  # 3. Tiered trail (highest active tier wins)
+  # 3. Tiered trail (highest active tier wins, uses mfe for activation)
   if mfe >= tier3_activation_ticks and tier3_activation_ticks > 0:
       stop_level = max(stop_level, mfe - tier3_trail_distance)
   elif mfe >= tier2_activation_ticks and tier2_activation_ticks > 0:
@@ -67,10 +77,14 @@ Every bar:
       stop_level = max(stop_level, mfe - tier1_trail_distance)
 
   # 4. Velocity ratchet
-  if velocity_lookback_bars > 0:
-      recent_move = current_pnl - pnl_N_bars_ago
+  if velocity_lookback_bars > 0 and len(pnl_history) >= velocity_lookback_bars:
+      recent_move = current_pnl - pnl_history[-velocity_lookback_bars]
       if recent_move >= velocity_threshold_ticks:
           stop_level = max(stop_level, mfe - velocity_trail_distance)
+
+  # 5. Cross-bar ratchet: stop never moves backward
+  stop_level = max(stop_level, prev_stop_level)
+  prev_stop_level = stop_level
 
   # Exit check
   if current_pnl <= stop_level:
@@ -84,8 +98,8 @@ The binding mechanic (whichever produced the highest stop_level) is recorded as 
 ### Modified
 
 - Exit cascade becomes: adaptive stop -> max hold -> session end
-- Signal-based exits are removed (adaptive stop handles all profit-taking)
-- A ring buffer (numpy array, size = max velocity_lookback_bars) tracks recent P&L for velocity calculation
+- Signal-based exits are removed — the adaptive stop handles all profit-taking and loss-cutting mechanically. This is intentional: the entry model picks direction, the adaptive stop manages the trade. If the model's P(up) drops while the trade is profitable but no stop has activated yet, the trade holds. The sweep will find configs where this works (or doesn't) per regime.
+- A ring buffer (numpy array, size = max velocity_lookback_bars) tracks recent P&L for velocity calculation. Reset on each new trade entry.
 - Exit reason captures binding mechanic: `hard_sl`, `breakeven`, `tier1`, `tier2`, `tier3`, `velocity`, `max_hold`, `session_end`
 
 ### Unchanged
@@ -111,7 +125,7 @@ Old configs map to: tier1_activation = trail_activation_ticks, tier1_trail_dista
 |---|---|
 | hard_sl_ticks | 4, 6, 8, 10, 12 |
 | breakeven_trigger_ticks | 0, 2, 3, 4, 6 |
-| breakeven_lock_ticks | 0, 0.5, 1.0, 1.5, 2.0 |
+| breakeven_lock_ticks | 0.5, 1.0, 1.5, 2.0 |
 | tier1_activation_ticks | 0, 2, 3, 4, 6 |
 | tier1_trail_distance | 1.0, 1.5, 2.0, 3.0, 4.0 |
 | tier2_activation_ticks | 0, 5, 6, 8, 10 |
@@ -134,9 +148,10 @@ Old configs map to: tier1_activation = trail_activation_ticks, tier1_trail_dista
 
 1. For each tradeable regime pair, load its model and run regime-gated rolling inference
 2. Expanding train window, 1-month test window
-3. On each train fold: sample 1,000 random valid configs, backtest each, rank by net P&L (after commission at $0.70 RT)
+3. On each train fold: sample 1,000 random valid configs, backtest each, rank by net P&L / (1 + max_drawdown_ticks) (after commission at $0.59 RT, matching existing sweep). Minimum 50 trades required per train fold to consider a config valid — configs with fewer trades are discarded.
 4. Best train config evaluated on test fold (OOS)
 5. Aggregate OOS results across folds per regime pair
+6. Monte Carlo permutation test on final OOS results: shuffle trade labels 10K times, strategy must beat 95th percentile to claim significance
 
 ### Output
 
@@ -145,10 +160,11 @@ Saved to `results/adaptive_stop_sweep/YYYY-MM-DD_HHMMSS/`:
 - **`sweep_results.json`** — full results: per regime pair, per fold, best config, OOS metrics, exit reason breakdown
 - **`best_configs.json`** — winning config per regime pair (loadable by live bot)
 - **`sweep_log.csv`** — every sampled config + train/test performance (flat CSV for pandas/Excel analysis)
+- **`robustness_report.json`** — per regime pair: sensitivity analysis (perturb +/- 1 step), count of configs within 80% of best score (flat surface = robust, peaked surface = likely overfit), Monte Carlo permutation test p-values
 
 ### Runtime Estimate
 
-~9 tradeable regime pairs x 1,000 samples x 6-8 folds = 50K-70K backtests. Each backtest is vectorized and fast. Estimated 30-60 minutes total.
+~9 tradeable regime pairs x 1,000 samples x walk-forward folds (derived from data length, ~1 fold per month after initial train window). The backtest engine currently uses a Python for-loop over bars, so runtime depends on effective bar count per regime pair. If runtime exceeds a few hours, reduce to 300-500 samples per fold — random search degrades gracefully with fewer samples.
 
 ## Live Bot Integration Path
 
@@ -160,6 +176,11 @@ After sweep identifies winning configs:
 4. Adaptive stop tightening managed client-side via cancel/replace orders
 5. No live bot changes in this phase — sweep first, port winners later
 
-## Sensitivity / Robustness Check
+## Robustness Checks
 
-For each regime pair's winning config, perturb each parameter by +/- 1 step and re-run the backtest. If performance degrades sharply, the config is likely overfit. Only trust configs that degrade gracefully. Results included in sweep_results.json.
+1. **Sensitivity analysis:** For each regime pair's winning config, perturb each parameter by +/- 1 step and re-run the backtest. If performance degrades sharply, the config is likely overfit. Only trust configs that degrade gracefully.
+2. **Surface flatness:** Count how many of the 1,000 sampled configs score within 80% of the best. A flat surface (many "good enough" configs) suggests a real edge. A peaked surface (only the winner is good) suggests overfitting.
+3. **Monte Carlo permutation test:** Shuffle trade P&L labels 10K times. The winning config's OOS score must beat the 95th percentile of random shuffles to claim statistical significance.
+4. **Minimum trade count:** Configs with < 50 trades on a train fold are discarded. OOS results with < 30 trades are flagged as low-confidence.
+
+All results saved to `robustness_report.json`.
