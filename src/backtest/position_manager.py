@@ -59,8 +59,88 @@ class PositionManagerConfig:
     hard_sl_ticks: float = 12.0     # max adverse move before forced exit
     max_hold_bars: int = 300        # 5 minutes max hold
 
+    # Trailing stop (matches live bot logic)
+    trail_activation_ticks: float = 0.0   # runup needed to activate trail (0 = disabled)
+    trail_distance_ticks: float = 0.0     # drawback from best to trigger trail exit
+
     # Commission
     commission_rt_dollars: float = 0.59  # round-trip commission
+
+
+@dataclass
+class AdaptiveStopConfig:
+    """Unified adaptive stop configuration. All params sweepable."""
+    # Entry thresholds (carried over from PositionManagerConfig)
+    long_entry: float = 0.70
+    short_entry: float = 0.30
+    max_hold_bars: int = 300
+    commission_rt_dollars: float = 0.59
+
+    # Hard stop
+    hard_sl_ticks: float = 8.0
+
+    # Breakeven lock
+    breakeven_trigger_ticks: float = 0.0
+    breakeven_lock_ticks: float = 0.0
+
+    # 3-Tier trailing stop
+    tier1_activation_ticks: float = 0.0
+    tier1_trail_distance: float = 2.0
+    tier2_activation_ticks: float = 0.0
+    tier2_trail_distance: float = 1.0
+    tier3_activation_ticks: float = 0.0
+    tier3_trail_distance: float = 0.5
+
+    # Velocity ratchet
+    velocity_lookback_bars: int = 0
+    velocity_threshold_ticks: float = 0.0
+    velocity_trail_distance: float = 0.5
+
+    def validate(self) -> None:
+        """Raise ValueError if constraints violated."""
+        active_tiers = []
+        for i, act in enumerate([
+            self.tier1_activation_ticks,
+            self.tier2_activation_ticks,
+            self.tier3_activation_ticks,
+        ], 1):
+            if act > 0:
+                active_tiers.append((i, act))
+
+        for j in range(1, len(active_tiers)):
+            prev_idx, prev_act = active_tiers[j - 1]
+            cur_idx, cur_act = active_tiers[j]
+            if cur_act <= prev_act:
+                raise ValueError(
+                    f"tier{cur_idx}_activation ({cur_act}) must be > "
+                    f"tier{prev_idx}_activation ({prev_act})"
+                )
+
+        tiers_enabled = [
+            self.tier1_activation_ticks > 0,
+            self.tier2_activation_ticks > 0,
+            self.tier3_activation_ticks > 0,
+        ]
+        for i in range(1, 3):
+            if tiers_enabled[i] and not tiers_enabled[i - 1]:
+                raise ValueError(
+                    f"tier{i + 1} enabled but tier{i} disabled"
+                )
+
+        dists = [
+            (1, self.tier1_activation_ticks, self.tier1_trail_distance),
+            (2, self.tier2_activation_ticks, self.tier2_trail_distance),
+            (3, self.tier3_activation_ticks, self.tier3_trail_distance),
+        ]
+        active_dists = [(idx, d) for idx, act, d in dists if act > 0]
+        for j in range(1, len(active_dists)):
+            prev_idx, prev_d = active_dists[j - 1]
+            cur_idx, cur_d = active_dists[j]
+            if cur_d >= prev_d:
+                raise ValueError(
+                    f"tier{cur_idx}_trail ({cur_d}) must be < "
+                    f"tier{prev_idx}_trail ({prev_d})"
+                )
 
 
 class PositionManager:
@@ -79,6 +159,8 @@ class PositionManager:
         self._entry_bar: int = 0
         self._entry_price: float = 0.0
         self._entry_p_up: float = 0.0
+        self._best_price: float = 0.0
+        self._trail_active: bool = False
 
     def update(self, bar_idx: int, p_up: float, mid: float) -> Trade | None:
         """Process one bar. Returns a Trade if a position was closed this bar.
@@ -113,6 +195,8 @@ class PositionManager:
         self._entry_bar = bar_idx
         self._entry_price = mid
         self._entry_p_up = p_up
+        self._best_price = mid
+        self._trail_active = False
 
     def _close(self, bar_idx: int, p_up: float, mid: float, reason: str) -> Trade:
         if self._side == Side.LONG:
@@ -140,24 +224,39 @@ class PositionManager:
         cfg = self.config
         hold_bars = bar_idx - self._entry_bar
 
-        # 1. Hard SL check
+        # Track best price (MFE)
         if self._side == Side.LONG:
-            adverse_ticks = (self._entry_price - mid) / MES_TICK
+            self._best_price = max(self._best_price, mid)
+            runup = (self._best_price - self._entry_price) / MES_TICK
+            current_pnl = (mid - self._entry_price) / MES_TICK
         else:
-            adverse_ticks = (mid - self._entry_price) / MES_TICK
+            self._best_price = min(self._best_price, mid)
+            runup = (self._entry_price - self._best_price) / MES_TICK
+            current_pnl = (self._entry_price - mid) / MES_TICK
 
-        if adverse_ticks >= cfg.hard_sl_ticks:
+        # 1. Hard SL check
+        if current_pnl <= -cfg.hard_sl_ticks:
             return self._close(bar_idx, p_up, mid, "hard_sl")
 
-        # 2. Max hold time
+        # 2. Trailing stop (matches live bot logic)
+        if cfg.trail_activation_ticks > 0:
+            if not self._trail_active and runup >= cfg.trail_activation_ticks:
+                self._trail_active = True
+            if self._trail_active:
+                drawback = runup - current_pnl
+                if drawback >= cfg.trail_distance_ticks:
+                    return self._close(bar_idx, p_up, mid, "trail")
+
+        # 3. Max hold time
         if hold_bars >= cfg.max_hold_bars:
             return self._close(bar_idx, p_up, mid, "max_hold")
 
-        # 3. Signal-based exit
-        if self._side == Side.LONG and p_up < cfg.long_exit:
-            return self._close(bar_idx, p_up, mid, "signal")
-        if self._side == Side.SHORT and p_up > cfg.short_exit:
-            return self._close(bar_idx, p_up, mid, "signal")
+        # 4. Signal-based exit (only if trail not active — trail takes priority)
+        if not self._trail_active:
+            if self._side == Side.LONG and p_up < cfg.long_exit:
+                return self._close(bar_idx, p_up, mid, "signal")
+            if self._side == Side.SHORT and p_up > cfg.short_exit:
+                return self._close(bar_idx, p_up, mid, "signal")
 
         return None
 
@@ -178,3 +277,4 @@ class PositionManager:
     def reset(self) -> None:
         """Reset state for a new session (does NOT clear trade history)."""
         self._side = Side.FLAT
+        self._trail_active = False
