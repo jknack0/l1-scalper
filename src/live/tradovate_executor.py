@@ -80,11 +80,16 @@ class TradovateExecutor:
         data = resp.json()
 
         self._token = data["accessToken"]
-        # Token expires in expirationTime seconds (may come as string)
-        expiry = int(data.get("expirationTime", 3600))
-        self._token_expiry = time.time() + expiry
-
-        logger.info("Authenticated. Token expires in %ds", expiry)
+        # expirationTime is an ISO timestamp like "2026-03-25T04:06:49.656Z"
+        exp_raw = data.get("expirationTime", "")
+        if isinstance(exp_raw, str) and "T" in exp_raw:
+            from datetime import datetime
+            exp_dt = datetime.fromisoformat(exp_raw.replace("Z", "+00:00"))
+            self._token_expiry = exp_dt.timestamp()
+            logger.info("Authenticated. Token expires at %s", exp_raw)
+        else:
+            self._token_expiry = time.time() + 3600
+            logger.info("Authenticated. Token expiry defaulting to 1h")
 
         # Get account info
         self._fetch_account()
