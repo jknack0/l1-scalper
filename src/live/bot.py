@@ -544,22 +544,9 @@ class LiveBot:
         self._trail_active = False
         self._active_model = mc.regime_name
 
-        # Place hard SL
-        if side == Side.LONG:
-            sl_price = self._entry_price - mc.sl_ticks * MES_TICK
-            sl_action = "Sell"
-        else:
-            sl_price = self._entry_price + mc.sl_ticks * MES_TICK
-            sl_action = "Buy"
-
-        try:
-            sl_result = self.executor.place_stop_order(
-                self._contract_id, sl_action, sl_price,
-            )
-            self._active_sl_order_id = sl_result.get("orderId")
-            logger.info("  Hard SL placed @ %.2f (order=%s)", sl_price, self._active_sl_order_id)
-        except Exception as e:
-            logger.error("  Failed to place SL: %s", e)
+        # No exchange-side SL — managed internally to avoid double-exit issues
+        logger.info("  Internal SL: %.1f ticks, trail: act=%.1f dist=%.1f",
+                     mc.sl_ticks, mc.trail_activation, mc.trail_distance)
 
     def _check_exit(self, now: float) -> None:
         """Check hard SL, trailing stop, and max hold for active position."""
@@ -607,18 +594,11 @@ class LiveBot:
         now = time.time()
         mid = self.features.latest_mid
 
-        # Cancel SL order
-        if self._active_sl_order_id:
-            try:
-                self.executor.cancel_order(self._active_sl_order_id)
-            except Exception as e:
-                logger.warning("Failed to cancel SL order: %s", e)
-            self._active_sl_order_id = None
-
         # Close via market order
         action = "Sell" if self._side == Side.LONG else "Buy"
         try:
-            self.executor.place_market_order(self._contract_id, action)
+            close_result = self.executor.place_market_order(self._contract_id, action)
+            logger.info("  Close order: %s", close_result.get("orderId", "?"))
         except Exception as e:
             logger.error("Failed to close position: %s", e)
             # Try flatten as fallback
@@ -627,11 +607,13 @@ class LiveBot:
             except Exception:
                 logger.error("CRITICAL: Could not flatten position!")
 
-        # Calculate P&L
+        # Calculate P&L using bid/ask (best estimate without fill confirmation)
         if self._side == Side.LONG:
-            pnl_ticks = (self.features.latest_bid - self._entry_price) / MES_TICK
+            exit_price = self.features.latest_bid
+            pnl_ticks = (exit_price - self._entry_price) / MES_TICK
         else:
-            pnl_ticks = (self._entry_price - self.features.latest_ask) / MES_TICK
+            exit_price = self.features.latest_ask
+            pnl_ticks = (self._entry_price - exit_price) / MES_TICK
 
         pnl_dollars = pnl_ticks * 1.25  # MES tick value
         self._daily_pnl += pnl_dollars
