@@ -28,7 +28,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.backtest.engine import BacktestResult, run_backtest
-from src.backtest.position_manager import AdaptiveStopConfig, MES_TICK_VALUE
+from src.backtest.position_manager import AdaptiveStopConfig, MES_TICK, MES_TICK_VALUE
 from src.backtest.rolling_inference import rolling_inference
 from src.models.dataset import (
     _compute_features, _filter_rth, _resample_to_1sec, _z_score_normalize,
@@ -40,6 +40,7 @@ from src.regime.micro_features_v2 import micro_features_from_1s_bars
 DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 MODEL_DIR = Path(__file__).resolve().parents[1] / "models"
 L1_DIR = DATA_DIR / "l1"
+RESULTS_DIR = Path(__file__).resolve().parents[1] / "results" / "adaptive_stop_sweep"
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,9 @@ MIN_TRAIN_TRADES = 50
 MIN_OOS_TRADES = 30
 
 ENTRY_THRESHOLDS = [0.60, 0.65, 0.70, 0.75, 0.80, 0.85]
+
+# Walk-forward settings
+WF_MIN_TRAIN_BARS = 50_000
 
 PARAM_RANGES = {
     "hard_sl_ticks": [4, 6, 8, 10, 12],
@@ -133,3 +137,519 @@ def sample_valid_config(rng: np.random.Generator) -> AdaptiveStopConfig:
         max_hold_bars=MAX_HOLD,
         commission_rt_dollars=COMMISSION_RT,
     )
+
+
+# -- Scoring ----------------------------------------------------------
+
+def _score(result: BacktestResult) -> float:
+    """Score: net_pnl / (1 + max_drawdown_ticks). -inf if too few trades."""
+    if result.n_trades < MIN_TRAIN_TRADES:
+        return float("-inf")
+    return result.net_pnl_dollars / (1.0 + result.max_drawdown_ticks)
+
+
+# -- Sweep fold -------------------------------------------------------
+
+def _sweep_fold(
+    p_up: np.ndarray,
+    mid: np.ndarray,
+    bid: np.ndarray,
+    ask: np.ndarray,
+    session_breaks: np.ndarray,
+    n_samples: int,
+    rng: np.random.Generator,
+) -> tuple[AdaptiveStopConfig | None, float, list[dict]]:
+    """Random search on a train fold."""
+    best_config: AdaptiveStopConfig | None = None
+    best_score = float("-inf")
+    all_results: list[dict] = []
+
+    for entry_t in ENTRY_THRESHOLDS:
+        for _ in range(n_samples // len(ENTRY_THRESHOLDS)):
+            cfg = sample_valid_config(rng)
+            cfg.long_entry = entry_t
+            cfg.short_entry = 1.0 - entry_t
+
+            result = run_backtest(p_up, mid, bid, ask, session_breaks, cfg)
+            score = _score(result)
+
+            row = asdict(cfg)
+            row["n_trades"] = result.n_trades
+            row["win_rate"] = result.win_rate
+            row["net_pnl_dollars"] = result.net_pnl_dollars
+            row["max_drawdown_ticks"] = result.max_drawdown_ticks
+            row["profit_factor"] = result.profit_factor
+            row["score"] = score
+            all_results.append(row)
+
+            if score > best_score:
+                best_score = score
+                best_config = cfg
+
+    return best_config, best_score, all_results
+
+
+# -- Data helpers (copied from sweep_walkforward.py) -------------------
+
+def _load_bars(year: int) -> pd.DataFrame:
+    """Load L1 data, resample to 1-sec bars, filter to RTH."""
+    l1_path = L1_DIR / f"year={year}" / "data.parquet"
+    click.echo(f"  Loading L1 data for {year}...")
+    pf = pq.ParquetFile(l1_path)
+    df = pf.read().to_pandas()
+    click.echo(f"  {len(df):,} ticks")
+
+    bars = _resample_to_1sec(df)
+    del df
+    gc.collect()
+
+    bars = _filter_rth(bars)
+    click.echo(f"  {len(bars):,} RTH 1-sec bars")
+    return bars
+
+
+def _compute_regime_labels(
+    bars: pd.DataFrame,
+    macro_hmm_path: Path,
+    micro_hmm_path: Path,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute per-bar (macro_state, micro_state) using forward-only HMM.
+
+    Returns arrays of shape [n_bars] with state labels.
+    Macro updates every 300 bars, micro every 30 bars. Labels are held
+    constant between updates (same as live bot).
+    """
+    from src.regime.macro_hmm_v2 import MacroRegimeHMMv2
+    from src.regime.micro_hmm_v2 import MicroRegimeHMMv2
+
+    n_bars = len(bars)
+
+    # Load HMMs
+    macro_hmm = MacroRegimeHMMv2()
+    macro_hmm.load(macro_hmm_path)
+    micro_hmm = MicroRegimeHMMv2()
+    micro_hmm.load(micro_hmm_path)
+
+    # Compute macro features (300-bar windows)
+    macro_bars = pd.DataFrame({
+        "close": bars["mid"].values,
+        "volume": bars["total_vol"].values,
+    }, index=bars.index)
+    macro_feats, _ = macro_features_from_1s_bars(macro_bars, window=300)
+    del macro_bars
+    macro_feats_norm = macro_hmm.normalize(macro_feats)
+    macro_posteriors = macro_hmm.predict_proba_forward(macro_feats_norm)
+    macro_window_states = macro_posteriors.argmax(axis=1)
+
+    # Expand macro states to per-bar (held constant within each 300-bar window)
+    n_macro_windows = len(macro_window_states)
+    macro_states = np.full(n_bars, -1, dtype=np.int32)
+    for i in range(n_macro_windows):
+        start = i * 300
+        end = min((i + 1) * 300, n_bars)
+        macro_states[start:end] = macro_window_states[i]
+
+    # Compute micro features (30-bar windows)
+    micro_bars = pd.DataFrame({
+        "close": bars["mid"].values,
+        "volume": bars["total_vol"].values,
+        "spread_ticks": bars["spread_ticks"].values,
+        "ofi": (bars["bid_sz"].diff().fillna(0) - bars["ask_sz"].diff().fillna(0)).values,
+    })
+    micro_feats, _ = micro_features_from_1s_bars(micro_bars, window=30)
+    micro_feats_norm = micro_hmm.normalize(micro_feats)
+    micro_posteriors = micro_hmm.predict_proba_forward(micro_feats_norm)
+    micro_window_states = micro_posteriors.argmax(axis=1)
+
+    # Expand micro states to per-bar
+    n_micro_windows = len(micro_window_states)
+    micro_states = np.full(n_bars, -1, dtype=np.int32)
+    for i in range(n_micro_windows):
+        start = i * 30
+        end = min((i + 1) * 30, n_bars)
+        micro_states[start:end] = micro_window_states[i]
+
+    click.echo(f"  Regime labels: {n_macro_windows} macro windows, {n_micro_windows} micro windows")
+
+    # Distribution
+    for ms in range(macro_hmm.n_states):
+        pct = (macro_states == ms).sum() / n_bars * 100
+        click.echo(f"    macro={ms}: {pct:.1f}%")
+
+    return macro_states, micro_states
+
+
+def _get_month_boundaries(bar_timestamps: np.ndarray) -> list[tuple[int, int, str]]:
+    """Split bar indices into calendar months.
+
+    Args:
+        bar_timestamps: unix timestamp index of 1-sec bars.
+
+    Returns:
+        List of (start_idx, end_idx, label) tuples, one per month.
+    """
+    dt = pd.to_datetime(bar_timestamps, unit="s", utc=True).tz_convert("US/Eastern")
+    months = dt.to_period("M")
+
+    boundaries: list[tuple[int, int, str]] = []
+    unique_months = months.unique().sort_values()
+    for m in unique_months:
+        mask = months == m
+        indices = np.where(mask)[0]
+        if len(indices) > 0:
+            boundaries.append((indices[0], indices[-1] + 1, str(m)))
+
+    return boundaries
+
+
+def _adjust_session_breaks(session_breaks: np.ndarray, start: int, end: int) -> np.ndarray:
+    """Adjust session breaks to be relative to a slice [start:end]."""
+    mask = (session_breaks >= start) & (session_breaks < end)
+    return session_breaks[mask] - start
+
+
+# -- CLI ---------------------------------------------------------------
+
+@click.command()
+@click.option("--year", default=2025, type=int, help="Year of data to use.")
+@click.option("--models", multiple=True, default=None,
+              help="Specific models to sweep. Default: all tradeable.")
+@click.option("--n-samples", default=1000, type=int,
+              help="Number of random config samples per fold.")
+@click.option("--seed", default=42, type=int, help="Random seed.")
+@click.option("--window-size", default=30, type=int)
+@click.option("--model-dir", default=None, type=str)
+@click.option("--batch-size", default=4096, type=int)
+@click.option("--verbose", "-v", is_flag=True)
+def main(
+    year: int,
+    models: tuple[str, ...],
+    n_samples: int,
+    seed: int,
+    window_size: int,
+    model_dir: str | None,
+    batch_size: int,
+    verbose: bool,
+) -> None:
+    """Walk-forward adaptive stop sweep with random search."""
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    overall_t0 = time.time()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    rng = np.random.default_rng(seed)
+
+    if model_dir is None:
+        model_dir_path = MODEL_DIR / "regime_v2_fold2" / f"w{window_size}"
+    else:
+        model_dir_path = Path(model_dir)
+
+    macro_hmm_path = MODEL_DIR / "macro_hmm_v2.pkl"
+    micro_hmm_path = MODEL_DIR / "micro_hmm_v2.pkl"
+
+    # Discover tradeable models
+    if models:
+        model_names = list(models)
+    else:
+        router_path = model_dir_path.parent / "router_w30.json"
+        if router_path.exists():
+            with open(router_path) as f:
+                router = json.load(f)
+            model_names = [entry["model_id"] for entry in router if entry.get("tradeable")]
+        else:
+            model_names = [p.stem for p in model_dir_path.glob("pair_*.pt")]
+
+    # Timestamped output directory
+    run_stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    run_dir = RESULTS_DIR / run_stamp
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    click.echo(f"{'=' * 70}")
+    click.echo("WALK-FORWARD ADAPTIVE STOP SWEEP (Random Search)")
+    click.echo(f"{'=' * 70}")
+    click.echo(f"  Year: {year}")
+    click.echo(f"  Models: {model_names}")
+    click.echo(f"  Window: {window_size}")
+    click.echo(f"  Device: {device}")
+    click.echo(f"  Samples per fold: {n_samples}")
+    click.echo(f"  Seed: {seed}")
+    click.echo(f"  Entry thresholds: {ENTRY_THRESHOLDS}")
+    click.echo(f"  Output: {run_dir}")
+    click.echo()
+
+    # -- Load data -------------------------------------------------
+    click.echo("[1/4] LOADING DATA")
+    bars = _load_bars(year)
+    bar_timestamps = bars.index.values
+
+    # Session breaks
+    gaps = np.diff(bar_timestamps)
+    session_breaks = np.where(gaps > 60)[0] + 1
+    click.echo(f"  {len(session_breaks)} session breaks")
+
+    # Month boundaries for walk-forward
+    month_bounds = _get_month_boundaries(bar_timestamps)
+    click.echo(f"  Months: {[m[2] for m in month_bounds]}")
+
+    # -- Compute features + regime labels --------------------------
+    click.echo("\n[2/4] COMPUTING FEATURES & REGIME LABELS")
+
+    raw_features = _compute_features(bars)
+    features = _z_score_normalize(raw_features)
+    del raw_features
+    gc.collect()
+
+    mid = bars["mid"].values.astype(np.float32)
+    bid = bars["bid"].values.astype(np.float32)
+    ask = bars["ask"].values.astype(np.float32)
+
+    macro_states, micro_states = _compute_regime_labels(bars, macro_hmm_path, micro_hmm_path)
+    del bars
+    gc.collect()
+
+    n_bars = len(features)
+    click.echo(f"  {n_bars:,} bars, {features.shape[1]} features")
+
+    # -- Per-model walk-forward sweep ------------------------------
+    click.echo(f"\n[3/4] WALK-FORWARD SWEEP")
+
+    all_model_results: dict[str, dict] = {}
+    best_configs: dict[str, dict] = {}
+    all_sweep_rows: list[dict] = []
+
+    for model_name in model_names:
+        model_path = model_dir_path / f"{model_name}.pt"
+        if not model_path.exists():
+            click.echo(f"\n  SKIP {model_name}: model not found at {model_path}")
+            continue
+
+        # Parse macro/micro state from name
+        parts = model_name.replace("pair_", "").split("_")
+        if len(parts) != 2:
+            click.echo(f"\n  SKIP {model_name}: can't parse regime pair")
+            continue
+        target_macro, target_micro = int(parts[0]), int(parts[1])
+
+        click.echo(f"\n{'-' * 70}")
+        click.echo(f"  MODEL: {model_name} (macro={target_macro}, micro={target_micro})")
+        click.echo(f"{'-' * 70}")
+
+        # Regime mask
+        regime_mask = (macro_states == target_macro) & (micro_states == target_micro)
+        n_regime_bars = regime_mask.sum()
+        click.echo(f"  Regime bars: {n_regime_bars:,} / {n_bars:,} ({n_regime_bars / n_bars * 100:.1f}%)")
+
+        if n_regime_bars < 1000:
+            click.echo(f"  SKIP: too few regime bars")
+            continue
+
+        # Load model and run inference on ALL bars
+        model = EntryModel(n_features=features.shape[1], seq_len=window_size).to(device)
+        model.load_state_dict(torch.load(model_path, weights_only=True, map_location=device))
+        model.eval()
+
+        t0 = time.time()
+        p_up = rolling_inference(model, features, window_size=window_size,
+                                 batch_size=batch_size, device=device)
+        click.echo(f"  Inference: {time.time() - t0:.1f}s")
+
+        del model
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+        # Mask P(up) to NaN outside this model's regime
+        p_up_gated = p_up.copy()
+        p_up_gated[~regime_mask] = np.nan
+
+        # Walk-forward
+        click.echo(f"\n  Walk-forward folds:")
+        fold_results = []
+
+        for test_idx in range(2, len(month_bounds)):
+            train_start = month_bounds[0][0]
+            train_end = month_bounds[test_idx][0]
+            test_start = month_bounds[test_idx][0]
+            test_end = month_bounds[test_idx][1]
+            test_label = month_bounds[test_idx][2]
+
+            # Check minimum train size
+            if (train_end - train_start) < WF_MIN_TRAIN_BARS:
+                continue
+
+            # Check test has enough regime bars
+            test_regime_bars = regime_mask[test_start:test_end].sum()
+            if test_regime_bars < 100:
+                click.echo(f"    {test_label}: SKIP (only {test_regime_bars} regime bars in test)")
+                continue
+
+            # Train slice
+            train_p_up = p_up_gated[train_start:train_end]
+            train_mid = mid[train_start:train_end]
+            train_bid = bid[train_start:train_end]
+            train_ask = ask[train_start:train_end]
+            train_sb = _adjust_session_breaks(session_breaks, train_start, train_end)
+
+            # Random search on train fold
+            fold_t0 = time.time()
+            best_cfg, best_train_score, fold_sweep_rows = _sweep_fold(
+                train_p_up, train_mid, train_bid, train_ask, train_sb,
+                n_samples, rng,
+            )
+            fold_elapsed = time.time() - fold_t0
+
+            # Tag sweep rows with model/fold info
+            for row in fold_sweep_rows:
+                row["model"] = model_name
+                row["fold"] = test_label
+                row["fold_type"] = "train"
+            all_sweep_rows.extend(fold_sweep_rows)
+
+            if best_cfg is None:
+                click.echo(f"    {test_label}: SKIP (no viable config in train, {fold_elapsed:.1f}s)")
+                continue
+
+            # Evaluate best config on test (OOS)
+            test_p_up = p_up_gated[test_start:test_end]
+            test_mid = mid[test_start:test_end]
+            test_bid = bid[test_start:test_end]
+            test_ask = ask[test_start:test_end]
+            test_sb = _adjust_session_breaks(session_breaks, test_start, test_end)
+
+            oos_result = run_backtest(test_p_up, test_mid, test_bid, test_ask, test_sb, best_cfg)
+
+            low_confidence = oos_result.n_trades < MIN_OOS_TRADES
+
+            fold_results.append({
+                "test_month": test_label,
+                "train_bars": train_end - train_start,
+                "test_bars": test_end - test_start,
+                "test_regime_bars": int(test_regime_bars),
+                "best_params": asdict(best_cfg),
+                "train_score": best_train_score,
+                "oos_n_trades": oos_result.n_trades,
+                "oos_win_rate": oos_result.win_rate,
+                "oos_avg_pnl_ticks": oos_result.avg_pnl_ticks,
+                "oos_profit_factor": oos_result.profit_factor,
+                "oos_net_pnl": oos_result.net_pnl_dollars,
+                "oos_max_dd_ticks": oos_result.max_drawdown_ticks,
+                "oos_avg_hold": oos_result.avg_hold_bars,
+                "low_confidence": low_confidence,
+                "oos_exits": {
+                    "signal": oos_result.exits_signal,
+                    "hard_sl": oos_result.exits_hard_sl,
+                    "trail": oos_result.exits_trail,
+                    "breakeven": oos_result.exits_breakeven,
+                    "tier1": oos_result.exits_tier1,
+                    "tier2": oos_result.exits_tier2,
+                    "tier3": oos_result.exits_tier3,
+                    "velocity": oos_result.exits_velocity,
+                    "max_hold": oos_result.exits_max_hold,
+                    "session": oos_result.exits_session_end,
+                },
+            })
+
+            # Print fold summary
+            pf_str = f"{oos_result.profit_factor:.2f}" if oos_result.profit_factor < 100 else "inf"
+            lc_str = " [LOW CONF]" if low_confidence else ""
+            click.echo(
+                f"    {test_label}: "
+                f"entry={best_cfg.long_entry:.2f} "
+                f"SL={best_cfg.hard_sl_ticks:.0f} "
+                f"BE={best_cfg.breakeven_trigger_ticks:.0f} "
+                f"T1={best_cfg.tier1_activation_ticks:.0f}/{best_cfg.tier1_trail_distance:.1f} "
+                f"-> OOS {oos_result.n_trades} trades, "
+                f"WR={oos_result.win_rate:.1%}, "
+                f"PF={pf_str}, "
+                f"Net=${oos_result.net_pnl_dollars:+,.2f}"
+                f"{lc_str} ({fold_elapsed:.1f}s)"
+            )
+
+        # Aggregate OOS results
+        if fold_results:
+            total_oos_pnl = sum(f["oos_net_pnl"] for f in fold_results)
+            total_oos_trades = sum(f["oos_n_trades"] for f in fold_results)
+            avg_oos_wr = np.mean([f["oos_win_rate"] for f in fold_results if f["oos_n_trades"] > 0])
+
+            click.echo(f"\n  AGGREGATE OOS: {total_oos_trades} trades, "
+                       f"WR={avg_oos_wr:.1%}, "
+                       f"Net=${total_oos_pnl:+,.2f} "
+                       f"({len(fold_results)} folds)")
+
+            all_model_results[model_name] = {
+                "macro_state": target_macro,
+                "micro_state": target_micro,
+                "n_regime_bars": int(n_regime_bars),
+                "regime_pct": n_regime_bars / n_bars * 100,
+                "total_oos_pnl": total_oos_pnl,
+                "total_oos_trades": total_oos_trades,
+                "avg_oos_win_rate": float(avg_oos_wr),
+                "n_folds": len(fold_results),
+                "folds": fold_results,
+            }
+
+            # Pick best config from the last fold as the "production" config
+            last_fold = fold_results[-1]
+            best_configs[model_name] = last_fold["best_params"]
+        else:
+            click.echo(f"\n  NO VALID FOLDS for {model_name}")
+            all_model_results[model_name] = {
+                "macro_state": target_macro,
+                "micro_state": target_micro,
+                "n_regime_bars": int(n_regime_bars),
+                "regime_pct": n_regime_bars / n_bars * 100,
+                "total_oos_pnl": 0.0,
+                "total_oos_trades": 0,
+                "n_folds": 0,
+                "folds": [],
+            }
+
+        del p_up, p_up_gated
+        gc.collect()
+
+    # -- Summary ---------------------------------------------------
+    click.echo(f"\n{'=' * 70}")
+    click.echo("WALK-FORWARD SUMMARY")
+    click.echo(f"{'=' * 70}")
+    click.echo(f"\n  {'Model':<12} {'Regime%':>8} {'Folds':>6} {'OOS Trades':>11} "
+               f"{'OOS WR':>7} {'OOS Net$':>10} {'Verdict':>10}")
+    click.echo(f"  {'-'*12} {'-'*8} {'-'*6} {'-'*11} {'-'*7} {'-'*10} {'-'*10}")
+
+    for name, r in sorted(all_model_results.items(), key=lambda x: x[1]["total_oos_pnl"], reverse=True):
+        verdict = "PROFITABLE" if r["total_oos_pnl"] > 0 else "UNPROFITABLE"
+        wr_str = f"{r.get('avg_oos_win_rate', 0):.1%}" if r["total_oos_trades"] > 0 else "N/A"
+        click.echo(
+            f"  {name:<12} {r['regime_pct']:>7.1f}% {r['n_folds']:>6} "
+            f"{r['total_oos_trades']:>11} {wr_str:>7} "
+            f"${r['total_oos_pnl']:>+9,.2f} {verdict:>10}"
+        )
+
+    # -- Save results ----------------------------------------------
+    click.echo(f"\n[4/4] SAVING RESULTS")
+
+    # sweep_results.json
+    out_path = run_dir / "sweep_results.json"
+    with open(out_path, "w") as f:
+        json.dump(all_model_results, f, indent=2, default=str)
+    click.echo(f"  {out_path}")
+
+    # best_configs.json
+    cfg_path = run_dir / "best_configs.json"
+    with open(cfg_path, "w") as f:
+        json.dump(best_configs, f, indent=2, default=str)
+    click.echo(f"  {cfg_path}")
+
+    # sweep_log.csv
+    if all_sweep_rows:
+        log_df = pd.DataFrame(all_sweep_rows)
+        csv_path = run_dir / "sweep_log.csv"
+        log_df.to_csv(csv_path, index=False)
+        click.echo(f"  {csv_path} ({len(log_df):,} rows)")
+
+    elapsed = time.time() - overall_t0
+    click.echo(f"\n  Total time: {elapsed:.0f}s ({elapsed / 60:.1f} min)")
+
+
+if __name__ == "__main__":
+    main()
