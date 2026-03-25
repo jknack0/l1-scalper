@@ -667,12 +667,23 @@ class LiveBot:
         else:
             regime_str = f"warming up ({self.regime._bars_seen}/300 bars)"
 
+        # Pull real P&L from Tradovate every ~60s
+        tv_pnl_str = ""
+        if self._bars_processed % 60 < 10:  # roughly every 60 heartbeats
+            try:
+                acct = self.executor.get_account_pnl()
+                if acct:
+                    tv_pnl_str = f" | TV: realized=${acct.get('realized_pnl', '?')} open=${acct.get('open_pnl', '?')}"
+            except Exception:
+                pass
+
         logger.info(
             "HEARTBEAT | mid=%.2f bid=%.2f ask=%.2f | %s | regime=[%s] | "
-            "ticks=%d bars=%d signals=%d trades=%d daily=$%.2f",
+            "ticks=%d bars=%d signals=%d trades=%d daily=$%.2f%s",
             mid, bid, ask, pos_str, regime_str,
             self._ticks_received, self._bars_processed,
             self._signals_generated, len(self.trades), self._daily_pnl,
+            tv_pnl_str,
         )
 
     def _print_summary(self) -> None:

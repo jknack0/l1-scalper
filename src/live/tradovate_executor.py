@@ -205,6 +205,34 @@ class TradovateExecutor:
         """Get all working orders."""
         return self._get("/order/list")
 
+    def get_fill_price(self, order_id: int) -> float | None:
+        """Get the fill price for a completed order."""
+        try:
+            fills = self._get(f"/fill/list")
+            for fill in fills:
+                if fill.get("orderId") == order_id:
+                    return float(fill.get("price", 0))
+        except Exception as e:
+            logger.warning("Could not get fill price for order %d: %s", order_id, e)
+        return None
+
+    def get_account_pnl(self) -> dict:
+        """Get current account P&L from Tradovate."""
+        try:
+            positions = self.get_positions()
+            realized = sum(float(p.get("prevPos", 0)) for p in positions)
+            # Cash balance gives the real P&L
+            accounts = self._get("/account/list")
+            if accounts:
+                return {
+                    "balance": accounts[0].get("balance", 0),
+                    "realized_pnl": accounts[0].get("realizedPnl", 0),
+                    "open_pnl": accounts[0].get("openPnl", 0),
+                }
+        except Exception as e:
+            logger.warning("Could not get account P&L: %s", e)
+        return {}
+
     def flatten_position(self, contract_id: int) -> dict | None:
         """Close any open position on a contract via market order."""
         positions = self.get_positions()
