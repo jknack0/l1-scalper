@@ -150,8 +150,11 @@ class PositionManager:
     Completed trades are appended to `self.trades`.
     """
 
-    def __init__(self, config: PositionManagerConfig | None = None) -> None:
-        self.config = config or PositionManagerConfig()
+    def __init__(self, config: AdaptiveStopConfig | PositionManagerConfig | None = None) -> None:
+        if config is None:
+            config = PositionManagerConfig()
+        self.config = config
+        self._use_adaptive = isinstance(config, AdaptiveStopConfig)
         self.trades: list[Trade] = []
 
         # Current position state
@@ -161,6 +164,11 @@ class PositionManager:
         self._entry_p_up: float = 0.0
         self._best_price: float = 0.0
         self._trail_active: bool = False
+        # Adaptive stop state
+        self._mfe: float = 0.0
+        self._prev_stop_level: float = 0.0
+        self._prev_binding: str = "hard_sl"
+        self._pnl_history: list[float] = []
 
     def update(self, bar_idx: int, p_up: float, mid: float) -> Trade | None:
         """Process one bar. Returns a Trade if a position was closed this bar.
@@ -197,6 +205,12 @@ class PositionManager:
         self._entry_p_up = p_up
         self._best_price = mid
         self._trail_active = False
+        # Reset adaptive state
+        if self._use_adaptive:
+            self._mfe = 0.0
+            self._prev_stop_level = -self.config.hard_sl_ticks
+            self._prev_binding = "hard_sl"
+            self._pnl_history = [0.0]
 
     def _close(self, bar_idx: int, p_up: float, mid: float, reason: str) -> Trade:
         if self._side == Side.LONG:
@@ -221,6 +235,8 @@ class PositionManager:
         return trade
 
     def _check_exit(self, bar_idx: int, p_up: float, mid: float) -> Trade | None:
+        if self._use_adaptive:
+            return self._check_exit_adaptive(bar_idx, p_up, mid)
         cfg = self.config
         hold_bars = bar_idx - self._entry_bar
 
@@ -260,6 +276,73 @@ class PositionManager:
 
         return None
 
+    def _check_exit_adaptive(self, bar_idx: int, p_up: float, mid: float) -> Trade | None:
+        cfg = self.config
+        hold_bars = bar_idx - self._entry_bar
+
+        if self._side == Side.LONG:
+            current_pnl = (mid - self._entry_price) / MES_TICK
+        else:
+            current_pnl = (self._entry_price - mid) / MES_TICK
+
+        self._mfe = max(self._mfe, current_pnl)
+        self._pnl_history.append(current_pnl)
+
+        stop_level = -cfg.hard_sl_ticks
+        binding = "hard_sl"
+
+        # Breakeven lock
+        if cfg.breakeven_trigger_ticks > 0 and self._mfe >= cfg.breakeven_trigger_ticks:
+            be_level = cfg.breakeven_lock_ticks
+            if be_level > stop_level:
+                stop_level = be_level
+                binding = "breakeven"
+
+        # Tiered trail (highest active tier, uses mfe for activation)
+        if cfg.tier3_activation_ticks > 0 and self._mfe >= cfg.tier3_activation_ticks:
+            t_level = self._mfe - cfg.tier3_trail_distance
+            if t_level > stop_level:
+                stop_level = t_level
+                binding = "tier3"
+        elif cfg.tier2_activation_ticks > 0 and self._mfe >= cfg.tier2_activation_ticks:
+            t_level = self._mfe - cfg.tier2_trail_distance
+            if t_level > stop_level:
+                stop_level = t_level
+                binding = "tier2"
+        elif cfg.tier1_activation_ticks > 0 and self._mfe >= cfg.tier1_activation_ticks:
+            t_level = self._mfe - cfg.tier1_trail_distance
+            if t_level > stop_level:
+                stop_level = t_level
+                binding = "tier1"
+
+        # Velocity ratchet
+        if (cfg.velocity_lookback_bars > 0
+                and len(self._pnl_history) > cfg.velocity_lookback_bars):
+            recent_move = current_pnl - self._pnl_history[-(cfg.velocity_lookback_bars + 1)]
+            if recent_move >= cfg.velocity_threshold_ticks:
+                v_level = self._mfe - cfg.velocity_trail_distance
+                if v_level > stop_level:
+                    stop_level = v_level
+                    binding = "velocity"
+
+        # Cross-bar ratchet: stop never moves backward
+        if stop_level > self._prev_stop_level:
+            self._prev_stop_level = stop_level
+            self._prev_binding = binding
+        else:
+            stop_level = self._prev_stop_level
+            binding = self._prev_binding
+
+        # Max hold (safety)
+        if hold_bars >= cfg.max_hold_bars:
+            return self._close(bar_idx, p_up, mid, "max_hold")
+
+        # Exit check
+        if current_pnl <= stop_level:
+            return self._close(bar_idx, p_up, mid, binding)
+
+        return None
+
     def force_close(self, bar_idx: int, p_up: float, mid: float) -> Trade | None:
         """Force close any open position (e.g., session end)."""
         if self._side != Side.FLAT:
@@ -278,3 +361,7 @@ class PositionManager:
         """Reset state for a new session (does NOT clear trade history)."""
         self._side = Side.FLAT
         self._trail_active = False
+        self._mfe = 0.0
+        self._prev_stop_level = 0.0
+        self._prev_binding = "hard_sl"
+        self._pnl_history = []

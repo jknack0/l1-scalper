@@ -1,8 +1,11 @@
 """Tests for adaptive stop mechanics."""
 from __future__ import annotations
 
+import numpy as np
 import pytest
-from src.backtest.position_manager import AdaptiveStopConfig
+from src.backtest.position_manager import (
+    AdaptiveStopConfig, PositionManager, Side, Trade, MES_TICK,
+)
 
 
 class TestAdaptiveStopConfig:
@@ -55,3 +58,168 @@ class TestAdaptiveStopConfig:
         """All optional mechanics disabled is valid (hard SL only)."""
         cfg = AdaptiveStopConfig(hard_sl_ticks=6.0)
         cfg.validate()
+
+
+class TestAdaptiveStopMechanics:
+    """Test the adaptive stop exit logic via PositionManager."""
+
+    def _run_position(
+        self, config: AdaptiveStopConfig, mid_prices: list[float], p_up: float = 0.80,
+    ) -> list[Trade]:
+        """Helper: open a long at bar 0 via high P(up), feed mid prices."""
+        pm = PositionManager(config)
+        pm.update(0, p_up, mid_prices[0])
+        assert pm.position_side == Side.LONG
+        for i in range(1, len(mid_prices)):
+            pm.update(i, 0.5, mid_prices[i])
+        return pm.trades
+
+    def test_hard_sl_only(self):
+        cfg = AdaptiveStopConfig(hard_sl_ticks=4.0)
+        cfg.validate()
+        mids = [5000.00] + [5000.00 - i * MES_TICK for i in range(1, 6)]
+        trades = self._run_position(cfg, mids)
+        assert len(trades) == 1
+        assert trades[0].exit_reason == "hard_sl"
+
+    def test_breakeven_lock(self):
+        cfg = AdaptiveStopConfig(
+            hard_sl_ticks=10.0,
+            breakeven_trigger_ticks=3.0,
+            breakeven_lock_ticks=1.0,
+        )
+        cfg.validate()
+        entry = 5000.00
+        mids = [entry]
+        for i in range(1, 5):
+            mids.append(entry + i * MES_TICK)
+        for i in range(4, -5, -1):
+            mids.append(entry + i * MES_TICK)
+        trades = self._run_position(cfg, mids)
+        assert len(trades) == 1
+        assert trades[0].exit_reason == "breakeven"
+
+    def test_tier1_trail(self):
+        cfg = AdaptiveStopConfig(
+            hard_sl_ticks=10.0,
+            tier1_activation_ticks=4.0,
+            tier1_trail_distance=2.0,
+        )
+        cfg.validate()
+        entry = 5000.00
+        mids = [entry]
+        for i in range(1, 7):
+            mids.append(entry + i * MES_TICK)
+        mids.append(entry + 5 * MES_TICK)
+        mids.append(entry + 4 * MES_TICK)
+        trades = self._run_position(cfg, mids)
+        assert len(trades) == 1
+        assert trades[0].exit_reason == "tier1"
+        assert trades[0].pnl_ticks == pytest.approx(4.0)
+
+    def test_tier_escalation(self):
+        cfg = AdaptiveStopConfig(
+            hard_sl_ticks=20.0,
+            tier1_activation_ticks=3.0, tier1_trail_distance=3.0,
+            tier2_activation_ticks=6.0, tier2_trail_distance=1.0,
+        )
+        cfg.validate()
+        entry = 5000.00
+        mids = [entry]
+        for i in range(1, 9):
+            mids.append(entry + i * MES_TICK)
+        mids.append(entry + 7 * MES_TICK)
+        trades = self._run_position(cfg, mids)
+        assert len(trades) == 1
+        assert trades[0].exit_reason == "tier2"
+        assert trades[0].pnl_ticks == pytest.approx(7.0)
+
+    def test_velocity_ratchet(self):
+        cfg = AdaptiveStopConfig(
+            hard_sl_ticks=20.0,
+            tier1_activation_ticks=2.0, tier1_trail_distance=4.0,
+            velocity_lookback_bars=3,
+            velocity_threshold_ticks=4.0,
+            velocity_trail_distance=0.5,
+        )
+        cfg.validate()
+        entry = 5000.00
+        mids = [entry]
+        for i in range(1, 4):
+            mids.append(entry + i * MES_TICK)
+        mids.append(entry + 5 * MES_TICK)
+        mids.append(entry + 6 * MES_TICK)
+        mids.append(entry + 7 * MES_TICK)
+        mids.append(entry + 6 * MES_TICK)
+        trades = self._run_position(cfg, mids)
+        assert len(trades) == 1
+        assert trades[0].exit_reason == "velocity"
+
+    def test_cross_bar_ratchet_never_loosens(self):
+        cfg = AdaptiveStopConfig(
+            hard_sl_ticks=20.0,
+            velocity_lookback_bars=2,
+            velocity_threshold_ticks=3.0,
+            velocity_trail_distance=1.0,
+            tier1_activation_ticks=2.0,
+            tier1_trail_distance=4.0,
+        )
+        cfg.validate()
+        entry = 5000.00
+        mids = [entry]
+        mids.append(entry + 2 * MES_TICK)
+        mids.append(entry + 4 * MES_TICK)
+        mids.append(entry + 4 * MES_TICK)
+        mids.append(entry + 3 * MES_TICK)
+        trades = self._run_position(cfg, mids)
+        assert len(trades) == 1
+        assert trades[0].pnl_ticks == pytest.approx(3.0)
+
+    def test_breakeven_and_tier_interaction(self):
+        cfg = AdaptiveStopConfig(
+            hard_sl_ticks=20.0,
+            breakeven_trigger_ticks=3.0,
+            breakeven_lock_ticks=1.5,
+            tier1_activation_ticks=2.0,
+            tier1_trail_distance=2.0,
+        )
+        cfg.validate()
+        entry = 5000.00
+        mids = [entry]
+        for i in range(1, 6):
+            mids.append(entry + i * MES_TICK)
+        mids.append(entry + 4 * MES_TICK)
+        mids.append(entry + 3 * MES_TICK)
+        trades = self._run_position(cfg, mids)
+        assert len(trades) == 1
+        assert trades[0].exit_reason == "tier1"
+        assert trades[0].pnl_ticks == pytest.approx(3.0)
+
+    def test_max_hold_still_works(self):
+        cfg = AdaptiveStopConfig(hard_sl_ticks=100.0, max_hold_bars=5)
+        cfg.validate()
+        mids = [5000.00] * 7
+        trades = self._run_position(cfg, mids)
+        assert len(trades) == 1
+        assert trades[0].exit_reason == "max_hold"
+
+    def test_short_position(self):
+        cfg = AdaptiveStopConfig(
+            hard_sl_ticks=10.0,
+            tier1_activation_ticks=3.0,
+            tier1_trail_distance=2.0,
+        )
+        cfg.validate()
+        pm = PositionManager(cfg)
+        entry = 5000.00
+        pm.update(0, 0.15, entry)
+        assert pm.position_side == Side.SHORT
+        for i in range(1, 6):
+            pm.update(i, 0.5, entry - i * MES_TICK)
+        pm.update(6, 0.5, entry - 4 * MES_TICK)
+        pm.update(7, 0.5, entry - 3 * MES_TICK)
+        trades = pm.trades
+        assert len(trades) == 1
+        assert trades[0].exit_reason == "tier1"
+        assert trades[0].side == Side.SHORT
+        assert trades[0].pnl_ticks == pytest.approx(3.0)
