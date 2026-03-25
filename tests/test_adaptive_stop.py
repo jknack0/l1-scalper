@@ -262,3 +262,52 @@ class TestBacktestEngineAdaptive:
         cfg = PositionManagerConfig(hard_sl_ticks=8.0)
         result = run_backtest(p_up, mid, config=cfg)
         assert result.n_trades >= 1
+
+
+class TestConfigSampler:
+    def test_sample_returns_valid_config(self):
+        """Every sampled config passes validation."""
+        import sys
+        from pathlib import Path
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+        from sweep_adaptive_stop import sample_valid_config
+
+        rng = np.random.default_rng(42)
+        for _ in range(200):
+            cfg = sample_valid_config(rng)
+            cfg.validate()
+
+    def test_sample_diversity(self):
+        """Samples produce diverse configs, not all identical."""
+        import sys
+        from pathlib import Path
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+        from sweep_adaptive_stop import sample_valid_config
+
+        rng = np.random.default_rng(42)
+        hard_sls = set()
+        for _ in range(100):
+            cfg = sample_valid_config(rng)
+            hard_sls.add(cfg.hard_sl_ticks)
+        assert len(hard_sls) >= 3
+
+    def test_disabled_mechanics_possible(self):
+        """Some samples should have mechanics disabled (0 values)."""
+        import sys
+        from pathlib import Path
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+        from sweep_adaptive_stop import sample_valid_config
+
+        rng = np.random.default_rng(42)
+        has_no_breakeven = False
+        has_no_trail = False
+        has_no_velocity = False
+        for _ in range(200):
+            cfg = sample_valid_config(rng)
+            if cfg.breakeven_trigger_ticks == 0:
+                has_no_breakeven = True
+            if cfg.tier1_activation_ticks == 0:
+                has_no_trail = True
+            if cfg.velocity_lookback_bars == 0:
+                has_no_velocity = True
+        assert has_no_breakeven and has_no_trail and has_no_velocity
