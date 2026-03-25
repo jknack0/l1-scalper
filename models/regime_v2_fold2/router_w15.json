@@ -1,0 +1,152 @@
+[
+  {
+    "macro_state": 0,
+    "micro_state": 0,
+    "model_id": "pair_0_0",
+    "tradeable": false,
+    "merged_into": null,
+    "n_train_samples": 69,
+    "baseline_accuracy": 0.5,
+    "mean_magnitude_ticks": 1.1956521272659302
+  },
+  {
+    "macro_state": 0,
+    "micro_state": 1,
+    "model_id": "pair_0_1",
+    "tradeable": false,
+    "merged_into": null,
+    "n_train_samples": 163,
+    "baseline_accuracy": 0.6326530612244898,
+    "mean_magnitude_ticks": 1.7791410684585571
+  },
+  {
+    "macro_state": 0,
+    "micro_state": 2,
+    "model_id": "pair_0_2",
+    "tradeable": false,
+    "merged_into": null,
+    "n_train_samples": 6,
+    "baseline_accuracy": 0.5,
+    "mean_magnitude_ticks": 0.0
+  },
+  {
+    "macro_state": 1,
+    "micro_state": 0,
+    "model_id": "pair_1_0",
+    "tradeable": true,
+    "merged_into": null,
+    "n_train_samples": 50223,
+    "baseline_accuracy": 0.6356275303643725,
+    "mean_magnitude_ticks": 1.925004482269287
+  },
+  {
+    "macro_state": 1,
+    "micro_state": 1,
+    "model_id": "pair_1_1",
+    "tradeable": true,
+    "merged_into": null,
+    "n_train_samples": 33831,
+    "baseline_accuracy": 0.6469950738916256,
+    "mean_magnitude_ticks": 1.5638614892959595
+  },
+  {
+    "macro_state": 1,
+    "micro_state": 2,
+    "model_id": "pair_1_2",
+    "tradeable": true,
+    "merged_into": null,
+    "n_train_samples": 71796,
+    "baseline_accuracy": 0.6352198337898696,
+    "mean_magnitude_ticks": 1.9851244688034058
+  },
+  {
+    "macro_state": 2,
+    "micro_state": 0,
+    "model_id": "pair_2_0",
+    "tradeable": false,
+    "merged_into": null,
+    "n_train_samples": 0,
+    "baseline_accuracy": 0.5,
+    "mean_magnitude_ticks": 0.0
+  },
+  {
+    "macro_state": 2,
+    "micro_state": 1,
+    "model_id": "pair_2_1",
+    "tradeable": false,
+    "merged_into": null,
+    "n_train_samples": 0,
+    "baseline_accuracy": 0.5,
+    "mean_magnitude_ticks": 0.0
+  },
+  {
+    "macro_state": 2,
+    "micro_state": 2,
+    "model_id": "pair_2_2",
+    "tradeable": false,
+    "merged_into": null,
+    "n_train_samples": 0,
+    "baseline_accuracy": 0.5,
+    "mean_magnitude_ticks": 0.0
+  },
+  {
+    "macro_state": 3,
+    "micro_state": 0,
+    "model_id": "pair_3_0",
+    "tradeable": true,
+    "merged_into": null,
+    "n_train_samples": 113235,
+    "baseline_accuracy": 0.6235023991051191,
+    "mean_magnitude_ticks": 2.4341015815734863
+  },
+  {
+    "macro_state": 3,
+    "micro_state": 1,
+    "model_id": "pair_3_1",
+    "tradeable": true,
+    "merged_into": null,
+    "n_train_samples": 28497,
+    "baseline_accuracy": 0.6550877192982456,
+    "mean_magnitude_ticks": 1.7708179950714111
+  },
+  {
+    "macro_state": 3,
+    "micro_state": 2,
+    "model_id": "pair_3_2",
+    "tradeable": true,
+    "merged_into": null,
+    "n_train_samples": 11466,
+    "baseline_accuracy": 0.5956395348837209,
+    "mean_magnitude_ticks": 2.54626727104187
+  },
+  {
+    "macro_state": 4,
+    "micro_state": 0,
+    "model_id": "pair_4_0",
+    "tradeable": true,
+    "merged_into": null,
+    "n_train_samples": 1326,
+    "baseline_accuracy": 0.628140703517588,
+    "mean_magnitude_ticks": 1.946455478668213
+  },
+  {
+    "macro_state": 4,
+    "micro_state": 1,
+    "model_id": "pair_4_1",
+    "tradeable": true,
+    "merged_into": null,
+    "n_train_samples": 9069,
+    "baseline_accuracy": 0.6427783902976847,
+    "mean_magnitude_ticks": 1.687506914138794
+  },
+  {
+    "macro_state": 4,
+    "micro_state": 2,
+    "model_id": "pair_4_2",
+    "tradeable": true,
+    "merged_into": null,
+    "n_train_samples": 59205,
+    "baseline_accuracy": 0.6413692151784709,
+    "mean_magnitude_ticks": 1.5185118913650513
+  }
+]

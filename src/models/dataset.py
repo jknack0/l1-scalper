@@ -618,6 +618,218 @@ def precompute_windows(
     return features_out, directions, magnitudes
 
 
+def _bracket_exit_labels(
+    mid: np.ndarray,
+    starts: np.ndarray,
+    tp_ticks: float = 9.0,
+    sl_ticks: float = 9.0,
+    max_hold_bars: int = 300,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Simulate bracket exit (TP/SL/timeout) for each entry window.
+
+    For each entry at bar `starts[i]`, simulates a LONG trade:
+    - TP hit if mid rises >= tp_ticks * MES_TICK from entry
+    - SL hit if mid drops >= sl_ticks * MES_TICK from entry
+    - Timeout after max_hold_bars (5 min at 1-sec bars)
+
+    Returns:
+        directions: [n_windows] float32 — 1.0 if trade was profitable, 0.0 otherwise
+        magnitudes: [n_windows] float32 — realized P&L in ticks (positive or negative)
+
+    Note: Labels assume LONG entry. The entry model predicts direction, so:
+    - For windows where model predicts long: use labels as-is
+    - For windows where model predicts short: labels would be flipped
+    Since we train on direction prediction, we label based on whether the
+    LONG side of the bracket would have been profitable. The model learns
+    when long vs short is correct.
+    """
+    n_windows = len(starts)
+    n_bars = len(mid)
+    tp_dist = tp_ticks * MES_TICK
+    sl_dist = sl_ticks * MES_TICK
+
+    directions = np.zeros(n_windows, dtype=np.float32)
+    magnitudes = np.zeros(n_windows, dtype=np.float32)
+
+    # Vectorized: for each start, get the future mid prices
+    # But max_hold_bars could be 300, and we have potentially millions of windows
+    # Do it in batches to control memory
+
+    batch_size = 10000
+    for batch_start in range(0, n_windows, batch_size):
+        batch_end = min(batch_start + batch_size, n_windows)
+        batch_starts = starts[batch_start:batch_end]
+        b = len(batch_starts)
+
+        # Entry prices
+        entry_prices = mid[batch_starts - 1]
+
+        # Future prices matrix: [batch, max_hold_bars]
+        # Clip to available bars
+        max_future = min(max_hold_bars, n_bars - batch_starts.max())
+        if max_future <= 0:
+            continue
+
+        future_idx = batch_starts[:, np.newaxis] - 1 + np.arange(1, max_future + 1)[np.newaxis, :]
+        # Clip indices to valid range
+        future_idx = np.clip(future_idx, 0, n_bars - 1)
+        future_prices = mid[future_idx]  # [batch, max_future]
+
+        # Compute running P&L from entry
+        pnl = future_prices - entry_prices[:, np.newaxis]  # [batch, max_future]
+
+        # Find first TP hit (pnl >= tp_dist)
+        tp_hit = pnl >= tp_dist
+        tp_bar = np.where(tp_hit.any(axis=1), tp_hit.argmax(axis=1), max_future + 1)
+
+        # Find first SL hit (pnl <= -sl_dist)
+        sl_hit = pnl <= -sl_dist
+        sl_bar = np.where(sl_hit.any(axis=1), sl_hit.argmax(axis=1), max_future + 1)
+
+        # Determine outcome: whichever hits first
+        tp_first = tp_bar < sl_bar
+        sl_first = sl_bar < tp_bar
+        timeout = ~tp_first & ~sl_first
+
+        # Magnitudes
+        batch_mag = np.zeros(b, dtype=np.float32)
+        batch_mag[tp_first] = tp_ticks
+        batch_mag[sl_first] = -sl_ticks
+        # Timeout: use actual P&L at max_hold or end of data
+        timeout_bar = np.minimum(max_future - 1, max_hold_bars - 1)
+        timeout_idx = np.clip(timeout_bar, 0, max_future - 1)
+        batch_mag[timeout] = (pnl[timeout, timeout_idx] / MES_TICK).astype(np.float32)
+
+        # Direction: profitable = 1
+        batch_dir = (batch_mag > 0).astype(np.float32)
+
+        directions[batch_start:batch_end] = batch_dir
+        magnitudes[batch_start:batch_end] = batch_mag
+
+    return directions, magnitudes
+
+
+def precompute_windows_bracket(
+    l1_path: Path,
+    window_size: int = 30,
+    tp_ticks: float = 9.0,
+    sl_ticks: float = 9.0,
+    max_hold_bars: int = 300,
+    stride: int = 1,
+    output_dir: Path | None = None,
+    output_name: str = "windows_bracket",
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Like precompute_windows but with bracket exit labels (TP/SL/timeout).
+
+    Labels reflect realistic 9:9 bracket with 5-min timeout instead of
+    simple forward-return at a fixed horizon.
+
+    Returns:
+        features: [n_windows, window_size, n_features] float32
+        directions: [n_windows] float32 — 1.0 if bracket trade profitable
+        magnitudes: [n_windows] float32 — realized P&L in ticks
+    """
+    effective_output_dir = output_dir or Path("/tmp/l1_scalper_windows")
+
+    # Reuse the chunked resample + feature pipeline
+    norm_features, mid, session_breaks = _resample_and_compute_chunked(
+        l1_path, effective_output_dir, output_name,
+    )
+
+    # Need enough future bars for bracket simulation
+    min_future = max_hold_bars
+    logger.info("  Building bracket windows (size=%d, stride=%d, TP=%g, SL=%g, maxhold=%d)...",
+                window_size, stride, tp_ticks, sl_ticks, max_hold_bars)
+
+    n_bars = len(norm_features)
+    n_features = norm_features.shape[1]
+    max_start = n_bars - window_size - min_future
+
+    if max_start <= 0:
+        return (
+            np.empty((0, window_size, n_features), dtype=np.float32),
+            np.empty(0, dtype=np.float32),
+            np.empty(0, dtype=np.float32),
+        )
+
+    starts = np.arange(window_size, max_start, stride)
+
+    # Remove cross-session windows
+    if len(session_breaks) > 0:
+        valid = np.ones(len(starts), dtype=bool)
+        for brk in session_breaks:
+            # Window + bracket hold must not span a session break
+            invalid = (starts - window_size + 1 <= brk) & (brk <= starts + min_future)
+            valid &= ~invalid
+        starts = starts[valid]
+        logger.info("  %d windows after removing cross-session spans", len(starts))
+
+    n_windows = len(starts)
+
+    if output_dir is not None:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        feat_path = output_dir / f"{output_name}_features.npy"
+        feat_mmap = np.lib.format.open_memmap(
+            str(feat_path), mode="w+",
+            dtype=np.float32, shape=(n_windows, window_size, n_features),
+        )
+        chunk = 1000
+        for i in range(0, n_windows, chunk):
+            end = min(i + chunk, n_windows)
+            batch_starts = starts[i:end]
+            idx = batch_starts[:, np.newaxis] - window_size + np.arange(window_size)[np.newaxis, :]
+            feat_mmap[i:end] = norm_features[idx]
+        feat_mmap.flush()
+        del feat_mmap
+        gc.collect()
+
+        # Bracket exit labels
+        mid_arr = np.array(mid)
+        directions, magnitudes = _bracket_exit_labels(
+            mid_arr, starts, tp_ticks=tp_ticks, sl_ticks=sl_ticks, max_hold_bars=max_hold_bars,
+        )
+        del mid_arr
+        gc.collect()
+
+        np.save(output_dir / f"{output_name}_directions.npy", directions)
+        np.save(output_dir / f"{output_name}_magnitudes.npy", magnitudes)
+
+        # Cleanup intermediate files
+        for suffix in ["_bars_features.npy", "_bars_mid.npy", "_session_breaks.npy"]:
+            (output_dir / f"{output_name}{suffix}").unlink(missing_ok=True)
+        del norm_features, mid
+        gc.collect()
+
+        logger.info("  %d bracket windows written", n_windows)
+        logger.info("  Win rate: %.3f, avg magnitude: %.2f ticks",
+                    directions.mean(), magnitudes.mean())
+
+        return (
+            np.load(str(feat_path), mmap_mode="r"),
+            np.load(str(output_dir / f"{output_name}_directions.npy"), mmap_mode="r"),
+            np.load(str(output_dir / f"{output_name}_magnitudes.npy"), mmap_mode="r"),
+        )
+
+    # In-memory fallback
+    window_idx = starts[:, np.newaxis] - window_size + np.arange(window_size)[np.newaxis, :]
+    features_out = norm_features[window_idx]
+    del norm_features
+    gc.collect()
+
+    mid_arr = np.array(mid)
+    directions, magnitudes = _bracket_exit_labels(
+        mid_arr, starts, tp_ticks=tp_ticks, sl_ticks=sl_ticks, max_hold_bars=max_hold_bars,
+    )
+    del mid_arr, mid
+    gc.collect()
+
+    logger.info("  %d bracket windows", n_windows)
+    logger.info("  Win rate: %.3f, avg magnitude: %.2f ticks",
+                directions.mean(), magnitudes.mean())
+
+    return features_out, directions, magnitudes
+
+
 class EntryDataset(Dataset):
     """PyTorch dataset for CNN-LSTM entry model.
 
@@ -664,6 +876,40 @@ class EntryDataset(Dataset):
             torch.from_numpy(feat),
             torch.from_numpy(np.array(self.directions[idx])),
             torch.from_numpy(np.array(self.magnitudes[idx])),
+        )
+
+
+class IndexedEntryDataset(Dataset):
+    """PyTorch dataset that reads from mmap by index — zero copy.
+
+    Instead of copying filtered arrays into RAM, stores integer indices
+    into the original mmap arrays. Each __getitem__ reads one window
+    from disk via mmap page cache. Much more memory efficient for large
+    filtered subsets.
+    """
+
+    def __init__(
+        self,
+        features: np.ndarray,
+        directions: np.ndarray,
+        magnitudes: np.ndarray,
+        indices: np.ndarray,
+    ) -> None:
+        self.features = features
+        self.directions = directions
+        self.magnitudes = magnitudes
+        self.indices = indices
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        real_idx = self.indices[idx]
+        feat = np.array(self.features[real_idx])
+        return (
+            torch.from_numpy(feat),
+            torch.tensor(self.directions[real_idx], dtype=torch.float32),
+            torch.tensor(self.magnitudes[real_idx], dtype=torch.float32),
         )
 
 
