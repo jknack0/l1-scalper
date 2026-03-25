@@ -25,6 +25,7 @@ from src.backtest.position_manager import (
     MES_TICK_VALUE,
     PositionManager,
     PositionManagerConfig,
+    AdaptiveStopConfig,
     Side,
     Trade,
 )
@@ -54,6 +55,12 @@ class BacktestResult:
     # Exit reason breakdown
     exits_signal: int
     exits_hard_sl: int
+    exits_trail: int
+    exits_breakeven: int
+    exits_tier1: int
+    exits_tier2: int
+    exits_tier3: int
+    exits_velocity: int
     exits_max_hold: int
     exits_session_end: int
 
@@ -64,7 +71,7 @@ def run_backtest(
     bid: np.ndarray | None = None,
     ask: np.ndarray | None = None,
     session_breaks: np.ndarray | None = None,
-    config: PositionManagerConfig | None = None,
+    config: PositionManagerConfig | AdaptiveStopConfig | None = None,
 ) -> BacktestResult:
     """Run backtest on P(up) signal with position management.
 
@@ -129,7 +136,9 @@ def _compute_stats(trades: list[Trade], commission_rt: float) -> BacktestResult:
             avg_pnl_ticks=0.0, avg_winner_ticks=0.0, avg_loser_ticks=0.0,
             profit_factor=0.0, max_drawdown_ticks=0.0, avg_hold_bars=0.0,
             commission_total=0.0, net_pnl_dollars=0.0,
-            exits_signal=0, exits_hard_sl=0, exits_max_hold=0, exits_session_end=0,
+            exits_signal=0, exits_hard_sl=0, exits_trail=0,
+            exits_breakeven=0, exits_tier1=0, exits_tier2=0, exits_tier3=0, exits_velocity=0,
+            exits_max_hold=0, exits_session_end=0,
         )
 
     pnls = np.array([t.pnl_ticks for t in trades])
@@ -175,6 +184,12 @@ def _compute_stats(trades: list[Trade], commission_rt: float) -> BacktestResult:
         net_pnl_dollars=net_pnl,
         exits_signal=reasons.count("signal"),
         exits_hard_sl=reasons.count("hard_sl"),
+        exits_trail=reasons.count("trail"),
+        exits_breakeven=reasons.count("breakeven"),
+        exits_tier1=reasons.count("tier1"),
+        exits_tier2=reasons.count("tier2"),
+        exits_tier3=reasons.count("tier3"),
+        exits_velocity=reasons.count("velocity"),
         exits_max_hold=reasons.count("max_hold"),
         exits_session_end=reasons.count("session_end"),
     )
@@ -198,4 +213,7 @@ def print_result(result: BacktestResult) -> None:
     print(f"  Max drawdown:    {r.max_drawdown_ticks:.1f} ticks (${r.max_drawdown_ticks * MES_TICK_VALUE:,.2f})")
     print(f"  Avg hold:        {r.avg_hold_bars:.0f} bars ({r.avg_hold_bars:.0f}s)")
     print(f"  Exits:           signal={r.exits_signal}, hard_sl={r.exits_hard_sl}, "
-          f"max_hold={r.exits_max_hold}, session={r.exits_session_end}")
+          f"trail={r.exits_trail}, max_hold={r.exits_max_hold}, session={r.exits_session_end}")
+    if any([r.exits_breakeven, r.exits_tier1, r.exits_tier2, r.exits_tier3, r.exits_velocity]):
+        print(f"  Adaptive exits:  breakeven={r.exits_breakeven}, tier1={r.exits_tier1}, "
+              f"tier2={r.exits_tier2}, tier3={r.exits_tier3}, velocity={r.exits_velocity}")

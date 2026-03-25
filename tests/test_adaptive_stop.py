@@ -223,3 +223,42 @@ class TestAdaptiveStopMechanics:
         assert trades[0].exit_reason == "tier1"
         assert trades[0].side == Side.SHORT
         assert trades[0].pnl_ticks == pytest.approx(3.0)
+
+
+from src.backtest.engine import run_backtest, BacktestResult
+
+
+class TestBacktestEngineAdaptive:
+    def test_run_backtest_with_adaptive_config(self):
+        """Engine accepts AdaptiveStopConfig and reports adaptive exit reasons."""
+        n = 200
+        mid = np.full(n, 5000.0)
+        p_up = np.full(n, 0.5)
+        p_up[10] = 0.80
+
+        for i in range(11, 20):
+            mid[i] = 5000.0 + min(i - 10, 6) * MES_TICK
+        for i in range(20, 30):
+            mid[i] = 5000.0 + max(6 - (i - 19), 0) * MES_TICK
+
+        cfg = AdaptiveStopConfig(
+            hard_sl_ticks=10.0,
+            tier1_activation_ticks=4.0,
+            tier1_trail_distance=2.0,
+        )
+        result = run_backtest(p_up, mid, config=cfg)
+        assert result.n_trades >= 1
+        assert result.exits_tier1 >= 1
+        assert result.exits_hard_sl == 0
+
+    def test_backward_compat_old_config(self):
+        """Engine still works with old PositionManagerConfig."""
+        from src.backtest.position_manager import PositionManagerConfig
+        n = 50
+        mid = np.full(n, 5000.0)
+        p_up = np.full(n, 0.5)
+        p_up[5] = 0.80
+        mid[10:] = 5000.0 - 15 * MES_TICK
+        cfg = PositionManagerConfig(hard_sl_ticks=8.0)
+        result = run_backtest(p_up, mid, config=cfg)
+        assert result.n_trades >= 1
