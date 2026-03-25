@@ -1,0 +1,32 @@
+[Unit]
+Description=L1 Scalper Bot (Paper Trading)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=botuser
+Group=botuser
+WorkingDirectory=/home/botuser/l1-scalper
+ExecStart=/home/botuser/l1-scalper/.venv/bin/python scripts/run_paper.py --symbol MESM6
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# Load .env for credentials
+EnvironmentFile=-/home/botuser/l1-scalper/.env
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=l1-scalper
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/home/botuser/l1-scalper
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

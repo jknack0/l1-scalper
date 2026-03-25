@@ -46,10 +46,14 @@ logger = logging.getLogger(__name__)
 
 COMMISSION_RT = 0.59
 MAX_HOLD = 300
-MIN_TRAIN_TRADES = 50
-MIN_OOS_TRADES = 30
+MIN_TRAIN_TRADES = 10
+MIN_OOS_TRADES = 5
 
-ENTRY_THRESHOLDS = [0.60, 0.65, 0.70, 0.75, 0.80, 0.85]
+# Z-score entry thresholds (symmetric: long if z >= threshold, short if z <= -threshold)
+ENTRY_THRESHOLDS = [1.5, 2.0, 2.5, 3.0]
+
+# Rolling z-score lookback
+ZSCORE_LOOKBACK = 300
 
 # Walk-forward settings
 WF_MIN_TRAIN_BARS = 50_000
@@ -139,6 +143,99 @@ def sample_valid_config(rng: np.random.Generator) -> AdaptiveStopConfig:
     )
 
 
+# -- Z-score computation -----------------------------------------------
+
+def _rolling_zscore(p_up: np.ndarray, lookback: int = ZSCORE_LOOKBACK) -> np.ndarray:
+    """Rolling z-score of P(up). Returns NaN where insufficient data."""
+    n = len(p_up)
+    z = np.full(n, np.nan, dtype=np.float32)
+    valid = np.isfinite(p_up)
+    p_clean = np.where(valid, p_up, 0.0)
+    cs = np.cumsum(p_clean)
+    cs2 = np.cumsum(p_clean ** 2)
+    cv = np.cumsum(valid.astype(np.float64))
+    min_samples = min(lookback, 120)
+    for i in range(min_samples, n):
+        if not valid[i]:
+            continue
+        j = max(0, i - lookback)
+        count = cv[i] - cv[j]
+        if count < 30:
+            continue
+        s = cs[i] - cs[j]
+        s2 = cs2[i] - cs2[j]
+        mean = s / count
+        var = s2 / count - mean ** 2
+        if var < 1e-10:
+            continue
+        z[i] = (p_up[i] - mean) / np.sqrt(var)
+    return z
+
+
+def _run_zscore_backtest(
+    z_scores: np.ndarray,
+    mid: np.ndarray,
+    bid: np.ndarray,
+    ask: np.ndarray,
+    session_breaks: np.ndarray,
+    entry_z: float,
+    cfg: AdaptiveStopConfig,
+    min_hold: int = 30,
+) -> BacktestResult:
+    """Backtest with z-score entry + adaptive stop exit.
+
+    Entry: z >= entry_z (long), z <= -entry_z (short)
+    Exit: managed by AdaptiveStopConfig logic
+    """
+    from src.backtest.position_manager import PositionManager, Side, Trade
+
+    n = len(z_scores)
+    session_set = set(session_breaks) if session_breaks is not None else set()
+
+    # Use a PositionManager with the adaptive config but override entry logic
+    pm = PositionManager(cfg)
+    cooldown_until = 0
+
+    for i in range(n):
+        # Session boundary
+        if i in session_set and not pm.is_flat:
+            pm.force_close(i, 0.5, mid[i])
+            pm.reset()
+            cooldown_until = i + min_hold
+
+        if not pm.is_flat:
+            # Let adaptive stop manage exit (pass dummy p_up since we don't use signal exit)
+            pm.update(i, 0.5, mid[i])
+        else:
+            if i < cooldown_until:
+                continue
+            z = z_scores[i]
+            if np.isnan(z):
+                continue
+            # Entry via z-score
+            if z >= entry_z:
+                pm._open(i, z, mid[i], Side.LONG)
+            elif z <= -entry_z:
+                pm._open(i, z, mid[i], Side.SHORT)
+
+    # Force close remaining
+    if not pm.is_flat:
+        pm.force_close(n - 1, 0.5, mid[n - 1])
+
+    trades = pm.trades
+
+    # Apply realistic fills
+    for t in trades:
+        if t.side == Side.LONG:
+            t.pnl_ticks = (bid[t.exit_bar] - ask[t.entry_bar]) / MES_TICK
+        else:
+            t.pnl_ticks = (bid[t.entry_bar] - ask[t.exit_bar]) / MES_TICK
+
+    # Build BacktestResult
+    from src.backtest.engine import _compute_stats
+    return _compute_stats(trades, cfg.commission_rt_dollars)
+
+
 # -- Scoring ----------------------------------------------------------
 
 def _score(result: BacktestResult) -> float:
@@ -151,29 +248,37 @@ def _score(result: BacktestResult) -> float:
 # -- Sweep fold -------------------------------------------------------
 
 def _sweep_fold(
-    p_up: np.ndarray,
+    z_scores: np.ndarray,
     mid: np.ndarray,
     bid: np.ndarray,
     ask: np.ndarray,
     session_breaks: np.ndarray,
     n_samples: int,
     rng: np.random.Generator,
-) -> tuple[AdaptiveStopConfig | None, float, list[dict]]:
-    """Random search on a train fold."""
-    best_config: AdaptiveStopConfig | None = None
+) -> tuple[tuple[AdaptiveStopConfig, float] | None, float, list[dict]]:
+    """Random search on a train fold using z-score entry."""
+    best_config = None
+    best_entry_z = 0.0
     best_score = float("-inf")
     all_results: list[dict] = []
+    total_iters = n_samples
+    completed = 0
+    t0 = time.time()
 
-    for entry_t in ENTRY_THRESHOLDS:
-        for _ in range(n_samples // len(ENTRY_THRESHOLDS)):
+    samples_per_entry = max(1, n_samples // len(ENTRY_THRESHOLDS))
+
+    for entry_z in ENTRY_THRESHOLDS:
+        for _ in range(samples_per_entry):
             cfg = sample_valid_config(rng)
-            cfg.long_entry = entry_t
-            cfg.short_entry = 1.0 - entry_t
 
-            result = run_backtest(p_up, mid, bid, ask, session_breaks, cfg)
+            result = _run_zscore_backtest(
+                z_scores, mid, bid, ask, session_breaks,
+                entry_z=entry_z, cfg=cfg,
+            )
             score = _score(result)
 
             row = asdict(cfg)
+            row["entry_z"] = entry_z
             row["n_trades"] = result.n_trades
             row["win_rate"] = result.win_rate
             row["net_pnl_dollars"] = result.net_pnl_dollars
@@ -185,23 +290,55 @@ def _sweep_fold(
             if score > best_score:
                 best_score = score
                 best_config = cfg
+                best_entry_z = entry_z
 
-    return best_config, best_score, all_results
+            completed += 1
+            if completed % 50 == 0:
+                elapsed = time.time() - t0
+                rate = completed / elapsed if elapsed > 0 else 0
+                eta = (total_iters - completed) / rate if rate > 0 else 0
+                logger.info("      sweep progress: %d/%d (%.1f/s, ETA %.0fs) best_score=%.2f",
+                            completed, total_iters, rate, eta, best_score)
+
+    if best_config is not None:
+        return (best_config, best_entry_z), best_score, all_results
+    return None, best_score, all_results
 
 
 # -- Data helpers (copied from sweep_walkforward.py) -------------------
 
-def _load_bars(year: int) -> pd.DataFrame:
-    """Load L1 data, resample to 1-sec bars, filter to RTH."""
-    l1_path = L1_DIR / f"year={year}" / "data.parquet"
-    click.echo(f"  Loading L1 data for {year}...")
-    pf = pq.ParquetFile(l1_path)
-    df = pf.read().to_pandas()
-    click.echo(f"  {len(df):,} ticks")
+def _load_bars(year: int, chunk_size: int = 10_000_000) -> pd.DataFrame:
+    """Load L1 data in chunks, resample to 1-sec bars, filter to RTH.
 
-    bars = _resample_to_1sec(df)
-    del df
+    Processes ticks in chunks to keep peak RAM manageable (~2-3GB instead of 8GB+).
+    """
+    l1_path = L1_DIR / f"year={year}" / "data.parquet"
+    click.echo(f"  Loading L1 data for {year} (chunked)...")
+    pf = pq.ParquetFile(l1_path)
+
+    all_bars = []
+    n_ticks = 0
+
+    for batch in pf.iter_batches(batch_size=chunk_size):
+        df_chunk = batch.to_pandas()
+        n_ticks += len(df_chunk)
+        click.echo(f"    processed {n_ticks:,} ticks...")
+
+        chunk_bars = _resample_to_1sec(df_chunk)
+        all_bars.append(chunk_bars)
+        del df_chunk
+        gc.collect()
+
+    click.echo(f"  {n_ticks:,} total ticks")
+
+    # Concatenate and re-aggregate bars that span chunk boundaries
+    bars = pd.concat(all_bars)
+    del all_bars
     gc.collect()
+
+    # Dedup: same second might appear in two chunks — keep last
+    bars = bars[~bars.index.duplicated(keep='last')]
+    bars = bars.sort_index()
 
     bars = _filter_rth(bars)
     click.echo(f"  {len(bars):,} RTH 1-sec bars")
@@ -546,9 +683,14 @@ def main(
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
-        # Mask P(up) to NaN outside this model's regime
+        # Mask P(up) to NaN outside this model's regime, then compute z-scores
         p_up_gated = p_up.copy()
         p_up_gated[~regime_mask] = np.nan
+        z_scores = _rolling_zscore(p_up_gated, lookback=ZSCORE_LOOKBACK)
+        valid_z = z_scores[np.isfinite(z_scores)]
+        if len(valid_z) > 0:
+            click.echo(f"  Z-score: mean={valid_z.mean():.3f}, std={valid_z.std():.3f}, "
+                       f"p5={np.percentile(valid_z, 5):.2f}, p95={np.percentile(valid_z, 95):.2f}")
 
         # Walk-forward
         click.echo(f"\n  Walk-forward folds:")
@@ -572,7 +714,7 @@ def main(
                 continue
 
             # Train slice
-            train_p_up = p_up_gated[train_start:train_end]
+            train_z = z_scores[train_start:train_end]
             train_mid = mid[train_start:train_end]
             train_bid = bid[train_start:train_end]
             train_ask = ask[train_start:train_end]
@@ -580,11 +722,13 @@ def main(
 
             # Random search on train fold
             fold_t0 = time.time()
-            best_cfg, best_train_score, fold_sweep_rows = _sweep_fold(
-                train_p_up, train_mid, train_bid, train_ask, train_sb,
+            best_result, best_train_score, fold_sweep_rows = _sweep_fold(
+                train_z, train_mid, train_bid, train_ask, train_sb,
                 n_samples, rng,
             )
             fold_elapsed = time.time() - fold_t0
+            best_cfg = best_result[0] if best_result else None
+            best_entry_z = best_result[1] if best_result else 0.0
 
             # Tag sweep rows with model/fold info
             for row in fold_sweep_rows:
@@ -598,13 +742,16 @@ def main(
                 continue
 
             # Evaluate best config on test (OOS)
-            test_p_up = p_up_gated[test_start:test_end]
+            test_z = z_scores[test_start:test_end]
             test_mid = mid[test_start:test_end]
             test_bid = bid[test_start:test_end]
             test_ask = ask[test_start:test_end]
             test_sb = _adjust_session_breaks(session_breaks, test_start, test_end)
 
-            oos_result = run_backtest(test_p_up, test_mid, test_bid, test_ask, test_sb, best_cfg)
+            oos_result = _run_zscore_backtest(
+                test_z, test_mid, test_bid, test_ask, test_sb,
+                entry_z=best_entry_z, cfg=best_cfg,
+            )
 
             low_confidence = oos_result.n_trades < MIN_OOS_TRADES
 
@@ -619,6 +766,7 @@ def main(
                 "train_bars": train_end - train_start,
                 "test_bars": test_end - test_start,
                 "test_regime_bars": int(test_regime_bars),
+                "best_entry_z": best_entry_z,
                 "best_params": asdict(best_cfg),
                 "train_score": best_train_score,
                 "oos_n_trades": oos_result.n_trades,
